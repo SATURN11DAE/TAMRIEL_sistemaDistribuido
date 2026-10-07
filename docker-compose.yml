@@ -1,0 +1,31 @@
+services:
+  skyrim:
+    build: .
+    container_name: skyrim
+    ports:
+      - "3001:3001"
+    command: ["./servidor", "skyrim"]
+    networks:
+      - tamriel_net
+
+  morrowind:
+    build: .
+    container_name: morrowind
+    ports:
+      - "3002:3002"
+    command: ["./servidor", "morrowind"]
+    networks:
+      - tamriel_net
+
+  cyrodiil:
+    build: .
+    container_name: cyrodiil
+    ports:
+      - "3003:3003"
+    command: ["./servidor", "cyrodiil"]
+    networks:
+      - tamriel_net
+
+networks:
+  tamriel_net:
+    driver: bridge
