@@ -4,7 +4,7 @@
 #include <strings.h>
 #include <curl/curl.h>
 
-#include "util/headersconfiguracoes.h"
+#include "util/headers/configuracoes.h"
 #include "util/headers/lamport.h"
 #include "util/headers/util.h"
 #include "headers/httpCliente.h"
