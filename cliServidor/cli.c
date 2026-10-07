@@ -3,11 +3,11 @@
 #include <string.h>
 #include <unistd.h>
 
-#include "util/configuracoes.h"
-#include "util/lamport.h"
-#include "util/util.h"
-#include "util/persistencia.h"
-#include "http/httpCliente.h"
+#include "util/headers/configuracoes.h"
+#include "util/headers/lamport.h"
+#include "util/headers/util.h"
+#include "util/headers/persistencia.h"
+#include "http/headers/httpCliente.h"
 
 #include "cli.h"
 

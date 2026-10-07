@@ -4,10 +4,10 @@
 #include <unistd.h>
 #include <curl/curl.h>
 
-#include "util/configuracoes.h"
-#include "util/persistencia.h"
-#include "http/httpServidor.h"
-#include "cli.h"
+#include "util/headers/configuracoes.h"
+#include "util/headers/persistencia.h"
+#include "http/headers/httpServidor.h"
+#include "cliServidor/cli.h"
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {

@@ -4,9 +4,9 @@
 #include <strings.h>
 #include <curl/curl.h>
 
-#include "util/configuracoes.h"
-#include "util/lamport.h"
-#include "util/util.h"
+#include "util/headersconfiguracoes.h"
+#include "util/headers/lamport.h"
+#include "util/headers/util.h"
 #include "headers/httpCliente.h"
 
 static size_t cabecalhoCorpo(void *dados, size_t tamanho, size_t n, void *ud) {

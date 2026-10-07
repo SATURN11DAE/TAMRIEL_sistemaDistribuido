@@ -2,10 +2,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "util/configuracoes.h"
-#include "util/lamport.h"
-#include "util/util.h"
-#include "util/persistencia.h"
+#include "util/headers/configuracoes.h"
+#include "util/headers/lamport.h"
+#include "util/headers/util.h"
+#include "util/headers/persistencia.h"
 
 #include "headers/httpServidor.h"
  
