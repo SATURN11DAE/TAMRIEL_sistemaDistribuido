@@ -2,7 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "util.h"
+#include "headers/util.h"
 
 void jsonEscape(const char *entrada, char *saida, size_t tamanho) {
     size_t j = 0;

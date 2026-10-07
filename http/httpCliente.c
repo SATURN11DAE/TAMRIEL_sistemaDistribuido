@@ -7,7 +7,7 @@
 #include "util/configuracoes.h"
 #include "util/lamport.h"
 #include "util/util.h"
-#include "httpCliente.h"
+#include "headers/httpCliente.h"
 
 static size_t cabecalhoCorpo(void *dados, size_t tamanho, size_t n, void *ud) {
     size_t real = tamanho * n;

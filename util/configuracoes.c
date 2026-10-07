@@ -3,7 +3,7 @@
 #include <string.h>
 #include <ctype.h>
 
-#include "configuracoes.h"
+#include "headers/configuracoes.h"
 
 Servidor servidor;
 

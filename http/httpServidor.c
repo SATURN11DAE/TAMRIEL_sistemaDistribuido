@@ -7,7 +7,7 @@
 #include "util/util.h"
 #include "util/persistencia.h"
 
-#include "httpServidor.h"
+#include "headers/httpServidor.h"
  
 typedef struct {
     char  *corpo;
@@ -48,7 +48,7 @@ static enum MHD_Result estaVivo(struct MHD_Connection *conexao) {
 
     return responder(conexao, MHD_HTTP_OK, json);
 }
- 
+
 // GET /trechos?origem=&destino=&visitados=a,b
 static enum MHD_Result buscarTrechos(struct MHD_Connection *conexao) {
     const char *origem  = MHD_lookup_connection_value(conexao, MHD_GET_ARGUMENT_KIND, "origem");

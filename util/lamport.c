@@ -1,6 +1,6 @@
 #include <pthread.h>
 
-#include "lamport.h"
+#include "headers/lamport.h"
 
 static int lamport = 0;
 static pthread_mutex_t trava = PTHREAD_MUTEX_INITIALIZER;

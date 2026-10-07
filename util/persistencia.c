@@ -6,9 +6,9 @@
 #include <pthread.h>
 #include <sys/stat.h>
 
-#include "persistencia.h"
-#include "lamport.h"
-#include "util.h"
+#include "headers/persistencia.h"
+#include "headers/lamport.h"
+#include "headers/util.h"
 
 static Reserva *reservas = NULL;
 static int quantidade = 0;
