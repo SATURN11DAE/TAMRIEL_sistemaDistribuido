@@ -2,12 +2,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <termios.h>
 
 #include "util/headers/configuracoes.h"
 #include "util/headers/lamport.h"
 #include "util/headers/util.h"
 #include "util/headers/persistencia.h"
 #include "http/headers/httpCliente.h"
+#include "util/headers/json.h"
+#include "consorcio/headers/cadastro.h"
+#include "consorcio/headers/busca.h"
+#include "consorcio/headers/transacao.h"
 
 #include "cli.h"
 
@@ -15,11 +20,49 @@ static char ultimaTransacao[64] = "";
 
 static int lerLinha(const char *prompt, char *buffer, size_t n) {
     printf("%s", prompt);
-
     fflush(stdout);
+    
+    buffer[0] = '\0';
     if (!fgets(buffer, (int) n, stdin)) return 0;
 
+    if (strchr(buffer, '\n') == NULL) {
+        int c;
+        while ((c = fgetc(stdin)) != '\n' && c != EOF);
+    }
+
     buffer[strcspn(buffer, "\r\n")] = 0;
+    return 1;
+}
+
+static int lerSenha(const char *prompt, char *buf, size_t n) {
+    struct termios antigo, novo;
+    int tty = isatty(STDIN_FILENO) && tcgetattr(STDIN_FILENO, &antigo) == 0;
+
+    printf("%s", prompt);
+    fflush(stdout);
+    
+    buf[0] = '\0';
+
+    if (tty) {
+        novo = antigo;
+        novo.c_lflag &= ~(tcflag_t) ECHO;
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &novo); 
+    }
+
+    char *ok = fgets(buf, (int) n, stdin);
+
+    if (tty) { 
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &antigo); 
+        printf("\n"); 
+    }
+    
+    if (ok && strchr(buf, '\n') == NULL) {
+        int c;
+        while ((c = fgetc(stdin)) != '\n' && c != EOF);
+    }
+    
+    if (!ok) return 0;
+    buf[strcspn(buf, "\r\n")] = 0;
     return 1;
 }
 
@@ -62,6 +105,62 @@ static void mostrar(const char *nome, int rc, Resposta *resposta) {
     respostaLiberar(resposta);
 }
 
+static void mostrarResp(const char *nome, Resp r) {
+    printf("\n>>> %s => HTTP %u\n%s\n", nome, r.http, r.json ? r.json : "");
+    free(r.json);
+}
+
+static void opcaoLocal(int op) {
+    char a[128]="", b[128]="", c[128]="", d[128]="", e[64]="", corpo[1024]="";
+    Buf buf; bufIni(&buf);
+
+    if (op == 10) {
+        lerLinha("id: ", a, sizeof a); 
+        lerLinha("nome: ", b, sizeof b);
+        lerLinha("tipo (motorista/passageiro): ", c, sizeof c);
+        lerSenha("senha: ", d, sizeof d);
+        
+        bufAdd(&buf, "{\"id\": "); bufStr(&buf, a); 
+        bufAdd(&buf, ", \"nome\": "); bufStr(&buf, b);
+        bufAdd(&buf, ", \"tipo\": "); bufStr(&buf, c); 
+        bufAdd(&buf, ", \"senha\": "); bufStr(&buf, d); 
+        bufAdd(&buf, "}");
+        
+        mostrarResp("usuario", cadastroUsuario(buf.p));
+    } else if (op == 11) {
+        lerLinha("motorista (id): ", a, sizeof a); lerLinha("origem: ", b, sizeof b);
+        lerLinha("destino: ", c, sizeof c); lerLinha("horario (texto livre): ", d, sizeof d);
+        lerLinha("preco: ", e, sizeof e); lerLinha("assentos: ", corpo, sizeof corpo);
+        bufAdd(&buf, "{\"motorista\": "); bufStr(&buf, a); bufAdd(&buf, ", \"origem\": ");
+        bufStr(&buf, b);
+        bufAdd(&buf, ", \"destino\": "); bufStr(&buf, c); bufAdd(&buf, ", \"horario\": ");
+        bufStr(&buf, d);
+        bufAdd(&buf, ", \"preco\": %.2f, \"assentos\": %d}", atof(e), atoi(corpo));
+        mostrarResp("carona", cadastroCarona(buf.p));
+    } else if (op == 12) {
+        mostrarResp("usuarios", cadastroListarUsuarios());
+        mostrarResp("caronas", cadastroListarCaronas());
+    } else if (op == 13) {
+        lerLinha("origem: ", a, sizeof a); lerLinha("destino: ", b, sizeof b);
+        mostrarResp("itinerarios", buscaItinerarios(a, b));
+    } else {
+        lerLinha("passageiro (id): ", a, sizeof a);
+        printf("Trechos na ordem, um por linha, no formato servidor:id_carona (linha vazia termina)\n");
+        bufAdd(&buf, "{\"passageiro\": "); bufStr(&buf, a); bufAdd(&buf, ", \"trechos\": [");
+        for (int i = 0; i < MAX_TRECHOS_TX; i++) {
+            lerLinha("  trecho: ", b, sizeof b);
+            char *dp = strchr(b, ':');
+            if (!b[0] || !dp) break;
+            *dp = 0;
+            bufAdd(&buf, "%s{\"servidor\": ", i ? ", " : ""); bufStr(&buf, b);
+            bufAdd(&buf, ", \"id_carona\": "); bufStr(&buf, dp + 1); bufAdd(&buf, "}");
+        }
+        bufAdd(&buf, "]}");
+        mostrarResp("reservar", txReservar(buf.p));
+    }
+    bufLiberar(&buf);
+}
+
 static void menu(void) {
     printf("\n=========== %s (porta %d) | relogio = %d ===========\n",
             servidor.id, servidor.porta, lamportMostrar());
@@ -75,6 +174,11 @@ static void menu(void) {
     printf(" 7) GET    reservas/{id}/status\n");
     printf(" 8) GET    reservas (lista o que o vizinho tem guardado)\n");
     printf(" 9) Ver as reservas guardadas AQUI (json/%s.json)\n", servidor.id);
+    printf("10) Cadastrar usuario (motorista/passageiro) AQUI\n");
+    printf("11) Publicar carona AQUI (motorista)\n");
+    printf("12) Listar usuarios e caronas AQUI\n");
+    printf("13) Buscar itinerarios (distribuido)\n");
+    printf("14) Reservar itinerario (2PC; este servidor coordena)\n");
     printf(" 0) Sair\n");
 }
 
@@ -112,6 +216,8 @@ void cliExecutar(void) {
             }
             continue;
         }
+
+        if (op >= 10 && op <= 14) { opcaoLocal(op); continue; }
 
         if (op < 1 || op > 8) {printf("Opcao invalida.\n"); continue;}
 

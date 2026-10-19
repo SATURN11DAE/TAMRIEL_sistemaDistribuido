@@ -11,14 +11,13 @@ RUN apt-get update && \
     make \
     libmicrohttpd-dev \
     libcurl4-openssl-dev \
+    libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 COPY . /app
 
 RUN make
 
-EXPOSE 3001
-EXPOSE 3002
-EXPOSE 3003
+EXPOSE 3001-3009
 
 CMD ["./servidor"]

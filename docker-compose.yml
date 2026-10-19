@@ -1,31 +1,106 @@
+x-hosts: &hosts
+  HOST_SKYRIM: ${HOST_SKYRIM:-skyrim}
+  HOST_MORROWIND: ${HOST_MORROWIND:-morrowind}
+  HOST_CYRODIIL: ${HOST_CYRODIIL:-cyrodiil}
+  HOST_HIGH_ROCK: ${HOST_HIGH_ROCK:-high_rock}
+  HOST_HAMMERFELL: ${HOST_HAMMERFELL:-hammerfell}
+  HOST_BLACK_MARSH: ${HOST_BLACK_MARSH:-black_marsh}
+  HOST_ELSWEYR: ${HOST_ELSWEYR:-elsweyr}
+  HOST_VALENWOOD: ${HOST_VALENWOOD:-valenwood}
+  HOST_SUMMERSET_ISLANDS: ${HOST_SUMMERSET_ISLANDS:-summerset_islands}
+
+x-servidor: &servidor
+  build: .
+  image: tamriel-consorcio
+  environment: *hosts
+  stdin_open: true
+  tty: true
+  networks:
+    - tamriel_net
+
 services:
   skyrim:
-    build: .
+    <<: *servidor
     container_name: skyrim
     ports:
       - "3001:3001"
     command: ["./servidor", "skyrim"]
-    networks:
-      - tamriel_net
+    volumes:
+      - ./data/skyrim:/app/json
 
   morrowind:
-    build: .
+    <<: *servidor
     container_name: morrowind
     ports:
       - "3002:3002"
     command: ["./servidor", "morrowind"]
-    networks:
-      - tamriel_net
+    volumes:
+      - ./data/morrowind:/app/json
 
   cyrodiil:
-    build: .
+    <<: *servidor
     container_name: cyrodiil
     ports:
       - "3003:3003"
     command: ["./servidor", "cyrodiil"]
-    networks:
-      - tamriel_net
+    volumes:
+      - ./data/cyrodiil:/app/json
+
+  high_rock:
+    <<: *servidor
+    container_name: high_rock
+    ports:
+      - "3004:3004"
+    command: ["./servidor", "high_rock"]
+    volumes:
+      - ./data/high_rock:/app/json
+
+  hammerfell:
+    <<: *servidor
+    container_name: hammerfell
+    ports:
+      - "3005:3005"
+    command: ["./servidor", "hammerfell"]
+    volumes:
+      - ./data/hammerfell:/app/json
+
+  black_marsh:
+    <<: *servidor
+    container_name: black_marsh
+    ports:
+      - "3006:3006"
+    command: ["./servidor", "black_marsh"]
+    volumes:
+      - ./data/black_marsh:/app/json
+
+  elsweyr:
+    <<: *servidor
+    container_name: elsweyr
+    ports:
+      - "3007:3007"
+    command: ["./servidor", "elsweyr"]
+    volumes:
+      - ./data/elsweyr:/app/json
+
+  valenwood:
+    <<: *servidor
+    container_name: valenwood
+    ports:
+      - "3008:3008"
+    command: ["./servidor", "valenwood"]
+    volumes:
+      - ./data/valenwood:/app/json
+
+  summerset_islands:
+    <<: *servidor
+    container_name: summerset_islands
+    ports:
+      - "3009:3009"
+    command: ["./servidor", "summerset_islands"]
+    volumes:
+      - ./data/summerset_islands:/app/json
 
 networks:
   tamriel_net:
     driver: bridge
+    

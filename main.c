@@ -8,8 +8,11 @@
 #include "util/headers/persistencia.h"
 #include "http/headers/httpServidor.h"
 #include "cliServidor/cli.h"
+#include "consorcio/headers/transacao.h"
 
 int main(int argc, char *argv[]) {
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     if (argc < 2) {
         printf("Uso: %s <regiao> [porta]\n\n", argv[0]);
         listarRegioes();
@@ -40,8 +43,11 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    txRecuperacaoIniciar();
+
     cliExecutar();
 
+    txRecuperacaoParar();
     servidorHTTPParar(satanas);
     armazenamentoEncerrar();
     curl_global_cleanup();

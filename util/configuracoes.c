@@ -26,7 +26,7 @@ static const Regiao REGIOES[] = {
 };
 #define QTD_REGIOES (int) (sizeof(REGIOES) / sizeof(REGIOES[0]))
 
-static void normalizar(const char *entrada, char *saida, size_t tamanho) {
+void configuracoesNormalizar(const char *entrada, char *saida, size_t tamanho) {
     size_t i;
     for (i = 0; entrada[i] && i < tamanho - 1; i++) {
         if (entrada[i] == ' ' || entrada[i] == '-') {
@@ -47,9 +47,22 @@ static const Regiao *buscarRegiao(const char *id) {
     return NULL;
 }
 
+int configuracoesRegiaoValida(const char *id) {
+    return buscarRegiao(id) != NULL;
+}
+
+int configuracoesSaoVizinhas(const char *a, const char *b) {
+    const Regiao *ra = buscarRegiao(a);
+    if (!ra) return 0;
+    for (int i = 0; ra->vizinhos[i]; i++) {
+        if (strcmp(ra->vizinhos[i], b) == 0) return 1;
+    }
+    return 0;
+}
+
 int configuracoesCarregar(const char *id, int portaOverride) {
     char normal[MAX_ID];
-    normalizar(id, normal, sizeof normal);
+    configuracoesNormalizar(id, normal, sizeof normal);
 
     const Regiao *eu = buscarRegiao(normal);
     if (!eu) return -1;
@@ -82,7 +95,7 @@ int configuracoesCarregar(const char *id, int portaOverride) {
 
 const Vizinho *buscarVizinho(const char *id) {
     char normal[MAX_ID];
-    normalizar(id, normal, sizeof normal);
+    configuracoesNormalizar(id, normal, sizeof normal);
 
     for (int i = 0; i < servidor.qtdVizinhos; i++) {
         if (strcmp(servidor.vizinhos[i].id, normal) == 0) {
