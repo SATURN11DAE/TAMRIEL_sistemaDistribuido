@@ -1,548 +1,894 @@
+/*
+ * Implementação das Transações Distribuídas (Two-Phase Commit em cadeia)
+ *
+ * Como funciona uma reserva que passa por vários servidores:
+ *   1. O servidor que recebe o pedido do passageiro é o COORDENADOR (txReservarComo).
+ *      Ele reserva os assentos dele (fase PREPARE) e repassa o restante do
+ *      itinerário ao próximo servidor da cadeia.
+ *   2. Cada participante (txPrepare) faz o mesmo: reserva os seus assentos, repassa
+ *      ao seguinte e devolve a lista de assentos de todos os que vêm depois.
+ *   3. Se todos disseram "READY", o coordenador DECIDE o commit (grava COMITADO
+ *      em disco) e manda o commit pela cadeia (txCommit). Se alguém recusou ou
+ *      caiu, o coordenador desfaz tudo (rollback).
+ *   4. Quem ficou PREPARADO sem receber decisão é resolvido pela thread de
+ *      recuperação, que pergunta o estado ao servidor anterior da cadeia.
+ *
+ * Estados de uma reserva: PREPARADO -> COMITADO -> CANCELANDO -> (apagada).
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
 
-#include "util/headers/configuracoes.h"
-#include "util/headers/lamport.h"
-#include "util/headers/persistencia.h"
-#include "util/headers/json.h"
-#include "http/headers/httpCliente.h"
+#include "headers/configuracoes.h"
+#include "headers/lamport.h"
+#include "headers/persistencia.h"
+#include "headers/json.h"
+#include "headers/httpCliente.h"
 #include "headers/transacao.h"
 
+/*
+ * Utilitário para testes: se a variável de ambiente INJETAR_FALHA for igual a
+ * 'ponto', o processo morre na hora (simula uma queda do servidor nesse ponto).
+ * Pontos usados: "antes_decisao", "depois_decisao" e "depois_cancelando".
+ */
 static void injetarFalha(const char *ponto) {
-    const char *e = getenv("INJETAR_FALHA");
-    if (e && strcmp(e, ponto) == 0) {
+    const char *envFalha = getenv("INJETAR_FALHA");
+    if (envFalha && strcmp(envFalha, ponto) == 0) {
         printf("[FALHA-INJETADA] processo encerrado em '%s'\n", ponto);
         fflush(stdout);
         _exit(137);
     }
 }
 
+/* Motivo de uma recusa ou falha ao encaminhar o prepare ao próximo servidor. */
 typedef struct {
-    unsigned int http;
-    char motivo[320];
-    int falhaRede;
+    unsigned int http;     /* código HTTP a devolver (409, 404 ou 502) */
+    char motivo[320];      /* texto explicando a falha */
+    int falhaRede;         /* 1 se o próximo servidor não respondeu (timeout, queda...) */
 } Falha;
 
-static int contarServidores(const TrechoRes *t, int n) {
-    int c = 0;
-    for (int i = 0; i < n; i++) if (i == 0 || strcmp(t[i].servidor, t[i - 1].servidor) != 0) c++;
-    return c;
-}
+/* Funções Auxiliares de Transação */
 
-static void montarCorpoPrepare(Buf *b, const Reserva *r, const TrechoRes *t, int n) {
-    bufAdd(b, "{\"id_transacao\": ");    bufStr(b, r->idTransacao);
-    bufAdd(b, ", \"coordenador_id\": "); bufStr(b, r->coordenadorId);
-    bufAdd(b, ", \"passageiro\": ");     bufStr(b, r->passageiro);
-    bufAdd(b, ", \"relogio_logico\": %d, \"trechos_solicitados\": [", r->relogio);
-    for (int i = 0; i < n; i++) {
-        bufAdd(b, "%s{\"servidor\": ", i ? ", " : ""); bufStr(b, t[i].servidor);
-        bufAdd(b, ", \"id_carona\": ");                bufStr(b, t[i].idCarona);
-        bufAdd(b, "}");
+/*
+ * Conta quantos servidores diferentes aparecem no vetor, considerando só
+ * mudanças consecutivas (os trechos do mesmo servidor vêm juntos).
+ */
+static int contarServidores(const TrechoRes *trechos, int quantidade) {
+    int contagem = 0;
+    for (int i = 0; i < quantidade; i++) {
+        if (i == 0 || strcmp(trechos[i].servidor, trechos[i - 1].servidor) != 0) contagem++;
     }
-    bufAdd(b, "]}");
+    return contagem;
 }
 
-static void assentosJSON(Buf *b, const TrechoRes *t, int n) {
-    bufAdd(b, "[");
-    for (int i = 0; i < n; i++) {
-        bufAdd(b, "%s{\"servidor\": ", i ? ", " : ""); bufStr(b, t[i].servidor);
-        bufAdd(b, ", \"id_carona\": ");                bufStr(b, t[i].idCarona);
-        bufAdd(b, ", \"assento\": %d}", t[i].assento);
+/*
+ * Monta o corpo JSON do prepare enviado ao próximo servidor.
+ *   - trechos / quantidade: o que ainda falta reservar (inclui os do próprio destinatário)
+ */
+static void montarCorpoPrepare(Buffer *buffer, const Reserva *reserva, const TrechoRes *trechos, int quantidade) {
+    bufferAdicionar(buffer, "{\"id_transacao\": ");    
+    bufferAdicionarStringJSON(buffer, reserva->idTransacao);
+    
+    bufferAdicionar(buffer, ", \"coordenador_id\": "); 
+    bufferAdicionarStringJSON(buffer, reserva->coordenadorId);
+    
+    bufferAdicionar(buffer, ", \"passageiro\": ");     
+    bufferAdicionarStringJSON(buffer, reserva->passageiro);
+    
+    bufferAdicionar(buffer, ", \"relogio_logico\": %d, \"trechos_solicitados\": [", reserva->relogio);
+    
+    for (int i = 0; i < quantidade; i++) {
+        bufferAdicionar(buffer, "%s{\"servidor\": ", i ? ", " : ""); 
+        bufferAdicionarStringJSON(buffer, trechos[i].servidor);
+        
+        bufferAdicionar(buffer, ", \"id_carona\": ");  
+        bufferAdicionarStringJSON(buffer, trechos[i].idCarona);
+
+        bufferAdicionar(buffer, ", \"origem\": ");
+        bufferAdicionarStringJSON(buffer, trechos[i].origem);
+
+        bufferAdicionar(buffer, ", \"destino\": ");
+        bufferAdicionarStringJSON(buffer, trechos[i].destino);
+        
+        bufferAdicionar(buffer, "}");
     }
-    bufAdd(b, "]");
+    bufferAdicionar(buffer, "]}");
 }
 
-static int propagar(const char *tipo, const char *proximo, const char *id) {
+/*
+ * Escreve como array JSON os trechos já com o assento escolhido
+ * (usado na resposta "READY" do prepare e na confirmação final).
+ */
+static void assentosJSON(Buffer *buffer, const TrechoRes *trechos, int quantidade) {
+    bufferAdicionar(buffer, "[");
+    for (int i = 0; i < quantidade; i++) {
+        bufferAdicionar(buffer, "%s{\"servidor\": ", i ? ", " : ""); 
+        bufferAdicionarStringJSON(buffer, trechos[i].servidor);
+        
+        bufferAdicionar(buffer, ", \"id_carona\": ");
+        bufferAdicionarStringJSON(buffer, trechos[i].idCarona);
+        
+        bufferAdicionar(buffer, ", \"origem\": ");
+        bufferAdicionarStringJSON(buffer, trechos[i].origem);
+
+        bufferAdicionar(buffer, ", \"destino\": ");
+        bufferAdicionarStringJSON(buffer, trechos[i].destino);
+        
+        bufferAdicionar(buffer, ", \"assento\": %d}", trechos[i].assento);
+    }
+    bufferAdicionar(buffer, "]");
+}
+
+/*
+ * Envia commit ou rollback ao próximo servidor da cadeia.
+ *   - tipo: "commit" ou "rollback"
+ *   - proximo: id do próximo servidor ("" se este for o último: nada a fazer)
+ * Retorna 0 se entregue (ou se não há próximo), -1 se não foi entregue.
+ * Quando falha, o próximo servidor resolve sozinho na recuperação.
+ */
+static int propagarComando(const char *tipo, const char *proximo, const char *idTransacao) {
     if (!proximo[0]) return 0;
 
     Resposta resp;
-    int rc = (strcmp(tipo, "commit") == 0) ? clienteCommitar(proximo, id, &resp)
-                                           : clienteRollback(proximo, id, &resp);
+    int rc = (strcmp(tipo, "commit") == 0) ? clienteCommitar(proximo, idTransacao, &resp)
+                                           : clienteRollback(proximo, idTransacao, &resp);
+    
     int entregue = (rc == 0 && resp.codigoHTTP == 200);
 
     if (!entregue) {
-        printf("[2PC] %s de %s NAO entregue a %s (%s); ele resolve na recuperacao\n", tipo, id, proximo,
-               rc != 0 ? resp.erro : "resposta != 200");
+        printf("[2PC] %s de %s NAO entregue a %s (%s); ele resolve na recuperacao\n", 
+               tipo, idTransacao, proximo, rc != 0 ? resp.erro : "resposta != 200");
     }
+    
     respostaLiberar(&resp);
     return entregue ? 0 : -1;
 }
 
-static Resp negar(unsigned int http, const char *id, const char *motivo) {
-    Buf b; bufIni(&b);
-    bufAdd(&b, "{\"id_transacao\": "); bufStr(&b, id);
-    bufAdd(&b, ", \"status\": \"NO\", \"servidor\": "); bufStr(&b, servidor.id);
-    bufAdd(&b, ", \"motivo\": "); bufStr(&b, motivo);
-    bufAdd(&b, "}\n");
-    return respJSON(http, bufTomar(&b));
+/*
+ * Monta a resposta "NO" do prepare (este servidor recusou a transação).
+ * Corpo: {"id_transacao", "status": "NO", "servidor", "motivo"}.
+ */
+static RespostaServidor negarAcesso(unsigned int http, const char *idTransacao, const char *motivo) {
+    Buffer buffer; 
+    bufferIniciar(&buffer);
+    
+    bufferAdicionar(&buffer, "{\"id_transacao\": "); 
+    bufferAdicionarStringJSON(&buffer, idTransacao);
+    
+    bufferAdicionar(&buffer, ", \"status\": \"NO\", \"servidor\": "); 
+    bufferAdicionarStringJSON(&buffer, servidor.id);
+    
+    bufferAdicionar(&buffer, ", \"motivo\": "); 
+    bufferAdicionarStringJSON(&buffer, motivo);
+    bufferAdicionar(&buffer, "}\n");
+    
+    return criarRespostaJSON(http, bufferExtrairTexto(&buffer));
 }
 
-static void motivoReserva(char *saida, size_t n, int rc, const Reserva *r) {
-    if (rc == ARMAZENAMENTO_NAO_ENCONTRADO) snprintf(saida, n, "carona %s nao existe em %s", r->falha, servidor.id);
-    else if (rc == ARMAZENAMENTO_INDISPONIVEL) snprintf(saida, n, "sem assento disponivel na carona %s (%s)", r->falha, servidor.id);
-    else snprintf(saida, n, "falha ao gravar a reserva em disco (%s)", servidor.id);
+/*
+ * Traduz o código de retorno de reservaPreparar para o código HTTP:
+ * NAO_ENCONTRADO -> 404, INDISPONIVEL -> 409, INVALIDO -> 400, outros -> 500.
+ */
+static unsigned int httpDeRc(int rc) {
+    return rc == ARMAZENAMENTO_NAO_ENCONTRADO ? 404
+         : rc == ARMAZENAMENTO_INDISPONIVEL   ? 409
+         : rc == ARMAZENAMENTO_INVALIDO       ? 400 : 500;
 }
 
-static int encaminharPrepare(const Reserva *r, const TrechoRes *resto, int n,
-                             TrechoRes *agr, int *nAgr, Falha *f) {
-    const char *prox = resto[0].servidor;
+/*
+ * Escreve em 'saida' a mensagem explicando por que reservaPreparar falhou.
+ *   - reserva: usa reserva->falha (id da carona responsável)
+ */
+static void motivoReserva(char *saida, size_t tamanho, int rc, const Reserva *reserva) {
+    if (rc == ARMAZENAMENTO_NAO_ENCONTRADO) {
+        snprintf(saida, tamanho, "carona %s nao existe em %s", reserva->falha, servidor.id);
+    } else if (rc == ARMAZENAMENTO_INDISPONIVEL) {
+        snprintf(saida, tamanho, "sem assento disponivel na carona %s (%s)", reserva->falha, servidor.id);
+    } else if (rc == ARMAZENAMENTO_INVALIDO) {
+        snprintf(saida, tamanho, "origem/destino fora da rota da carona %s (%s)", reserva->falha, servidor.id);
+    } else {
+        snprintf(saida, tamanho, "falha ao gravar a reserva em disco (%s)", servidor.id);
+    }
+}
 
-    Buf b; bufIni(&b);
-    montarCorpoPrepare(&b, r, resto, n);
+/*
+ * Repassa o prepare ao próximo servidor da cadeia e espera a resposta.
+ *   - resto / quantidadeRestante: trechos que faltam (o primeiro é do próximo servidor)
+ *   - agrupamento / qtdAgrupamento: recebem os assentos devolvidos por ele (e pelos seguintes)
+ *   - falha: preenchida com http, motivo e falhaRede quando não deu certo
+ * O prazo cresce com a quantidade de servidores restantes, pois a chamada é encadeada.
+ * Retorna 0 se o próximo respondeu READY (HTTP 200), -1 se recusou ou não respondeu.
+ */
+static int encaminharPrepare(const Reserva *reserva, const TrechoRes *resto, int quantidadeRestante,
+                             TrechoRes *agrupamento, int *qtdAgrupamento, Falha *falha) {
+    
+    const char *proximoServidor = resto[0].servidor;
 
-    long timeout = (long) (TIMEOUT_REQUISICAO + ESPERA_MAX_MS) * contarServidores(resto, n);
+    Buffer buffer; 
+    bufferIniciar(&buffer);
+    montarCorpoPrepare(&buffer, reserva, resto, quantidadeRestante);
+
+    long timeout = (long) (TIMEOUT_REQUISICAO + ESPERA_MAX_MS) * contarServidores(resto, quantidadeRestante);
 
     Resposta resp;
-    int rc = clientePrepararCorpo(prox, b.p, timeout, &resp);
-    bufLiberar(&b);
+    int rc = clientePrepararCorpo(proximoServidor, buffer.p, timeout, &resp);
+    bufferLiberar(&buffer);
 
-    memset(f, 0, sizeof *f);
+    memset(falha, 0, sizeof *falha);
 
     if (rc != 0) {
-        f->http = 502; f->falhaRede = 1;
-        snprintf(f->motivo, sizeof f->motivo, "servidor %s indisponivel (%s)", prox, resp.erro);
+        falha->http = 502; 
+        falha->falhaRede = 1;
+        snprintf(falha->motivo, sizeof falha->motivo, "servidor %s indisponivel (%s)", proximoServidor, resp.erro);
         respostaLiberar(&resp);
         return -1;
     }
 
-    JVal *j = jsonParse(resp.corpo);
+    ValorJSON *jsonResp = jsonAnalisar(resp.corpo);
 
     if (resp.codigoHTTP == 200) {
-        const JVal *as = jsonGet(j, "assentos");
-        for (int i = 0; i < jsonTam(as) && *nAgr < MAX_TRECHOS_TX; i++) {
-            const JVal *a = jsonIdx(as, i);
-            TrechoRes *d = &agr[(*nAgr)++];
-            memset(d, 0, sizeof *d);
-            snprintf(d->servidor, sizeof d->servidor, "%s", jsonGetStr(a, "servidor") ? jsonGetStr(a, "servidor") : "");
-            snprintf(d->idCarona, sizeof d->idCarona, "%s", jsonGetStr(a, "id_carona") ? jsonGetStr(a, "id_carona") : "");
-            d->assento = jsonGetInt(a, "assento", 0);
+        const ValorJSON *assentosResp = jsonObterCampo(jsonResp, "assentos");
+        int numAssentos = jsonTamanhoArray(assentosResp);
+        
+        for (int i = 0; i < numAssentos && *qtdAgrupamento < MAX_TRECHOS_TX; i++) {
+            const ValorJSON *a = jsonObterElemento(assentosResp, i);
+            TrechoRes *destino = &agrupamento[(*qtdAgrupamento)++];
+            
+            memset(destino, 0, sizeof *destino);
+            
+            const char *serv = jsonObterTexto(a, "servidor");
+            snprintf(destino->servidor, sizeof destino->servidor, "%s", serv ? serv : "");
+            
+            const char *idc = jsonObterTexto(a, "id_carona");
+            snprintf(destino->idCarona, sizeof destino->idCarona, "%s", idc ? idc : "");
+
+            const char *org = jsonObterTexto(a, "origem");
+            snprintf(destino->origem, sizeof destino->origem, "%s", org ? org : "");
+
+            const char *dst = jsonObterTexto(a, "destino");
+            snprintf(destino->destino, sizeof destino->destino, "%s", dst ? dst : "");
+            
+            destino->assento = jsonObterInteiro(a, "assento", 0);
         }
-        jsonLiberar(j);
+        
+        jsonLiberar(jsonResp);
         respostaLiberar(&resp);
         return 0;
     }
 
-    const char *m = jsonGetStr(j, "motivo");
-    if (!m) m = jsonGetStr(j, "erro");
-    f->http = (resp.codigoHTTP == 409 || resp.codigoHTTP == 404) ? (unsigned) resp.codigoHTTP : 502;
-    snprintf(f->motivo, sizeof f->motivo, "%s", m ? m : "recusado");
-    jsonLiberar(j);
+    const char *mensagemErro = jsonObterTexto(jsonResp, "motivo");
+    if (!mensagemErro) mensagemErro = jsonObterTexto(jsonResp, "erro");
+    
+    falha->http = (resp.codigoHTTP == 409 || resp.codigoHTTP == 404) ? (unsigned) resp.codigoHTTP : 502;
+    snprintf(falha->motivo, sizeof falha->motivo, "%s", mensagemErro ? mensagemErro : "recusado");
+    
+    jsonLiberar(jsonResp);
     respostaLiberar(&resp);
     return -1;
 }
 
-Resp txPrepare(const char *corpo, const char *remetente) {
-    JVal *j = corpo ? jsonParse(corpo) : NULL;
-    if (!j) return respErro(400, "Corpo JSON invalido");
+/* APIs Públicas do Two-Phase Commit */
 
-    const char *id = jsonGetStr(j, "id_transacao"), *coord = jsonGetStr(j, "coordenador_id");
-    const JVal *lista = jsonGet(j, "trechos_solicitados");
-    int n = jsonTam(lista);
+/*
+ * PARTICIPANTE, fase 1: recebe o prepare (POST /reservas/prepare).
+ * Reserva os trechos que pertencem a ESTE servidor, repassa o restante ao
+ * próximo servidor da cadeia e responde com os assentos de todos.
+ *   - corpo: JSON com id_transacao, coordenador_id, passageiro, relogio_logico
+ *     e trechos_solicitados (os deste servidor devem vir primeiro)
+ *   - remetente: X-Server-Id de quem enviou (vira o "anterior" da reserva)
+ * Idempotente: um prepare repetido não reserva duas vezes.
+ * Retorna 200 {"status": "READY", "assentos": [...]} se deu certo, ou o erro
+ * (400 corpo inválido, 404 carona inexistente, 409 sem assento, 502 falha adiante).
+ * Se algo falha adiante, a reserva local é desfeita antes de responder.
+ */
+RespostaServidor txPrepare(const char *corpo, const char *remetente) {
+    ValorJSON *json = corpo ? jsonAnalisar(corpo) : NULL;
+    if (!json) return criarRespostaErro(400, "Corpo JSON invalido");
 
-    if (!id || !idValido(id)) { jsonLiberar(j); return respErro(400, "id_transacao ausente ou invalido"); }
-    if (!coord || !*coord) { jsonLiberar(j); return respErro(400, "Corpo sem coordenador_id"); }
-    if (n < 1 || n > MAX_TRECHOS_TX) { jsonLiberar(j); return respErro(400, "trechos_solicitados deve ter de 1 a 8 itens"); }
+    const char *idTransacao = jsonObterTexto(json, "id_transacao");
+    const char *coordenador = jsonObterTexto(json, "coordenador_id");
+    const ValorJSON *listaTrechos = jsonObterCampo(json, "trechos_solicitados");
+    int numTrechos = jsonTamanhoArray(listaTrechos);
 
-    Reserva r;
-    memset(&r, 0, sizeof r);
-    snprintf(r.idTransacao, sizeof r.idTransacao, "%s", id);
-    snprintf(r.coordenadorId, sizeof r.coordenadorId, "%s", coord);
-    snprintf(r.passageiro, sizeof r.passageiro, "%s", jsonGetStr(j, "passageiro") ? jsonGetStr(j, "passageiro") : "");
-    snprintf(r.anterior, sizeof r.anterior, "%s", (remetente && *remetente) ? remetente : coord);
-    r.relogio = jsonGetInt(j, "relogio_logico", 0);
-    r.criadoEm = agoraSegundos();
-
-    TrechoRes todos[MAX_TRECHOS_TX];
-    for (int i = 0; i < n; i++) {
-        const JVal *t = jsonIdx(lista, i);
-        const char *srv = jsonGetStr(t, "servidor"), *idc = jsonGetStr(t, "id_carona");
-        if (!srv || !idc || !idValido(idc)) { jsonLiberar(j); return respErro(400, "trecho sem servidor ou com id_carona invalido"); }
-
-        memset(&todos[i], 0, sizeof todos[i]);
-        configuracoesNormalizar(srv, todos[i].servidor, sizeof todos[i].servidor);
-        snprintf(todos[i].idCarona, sizeof todos[i].idCarona, "%s", idc);
+    if (!idTransacao || !identificadorValido(idTransacao)) { 
+        jsonLiberar(json); 
+        return criarRespostaErro(400, "id_transacao ausente ou invalido"); 
     }
-    jsonLiberar(j);
-    id = r.idTransacao;
+    if (!coordenador || !*coordenador) { 
+        jsonLiberar(json); 
+        return criarRespostaErro(400, "Corpo sem coordenador_id"); 
+    }
+    if (numTrechos < 1 || numTrechos > MAX_TRECHOS_TX) { 
+        jsonLiberar(json); 
+        return criarRespostaErro(400, "trechos_solicitados deve ter de 1 a 8 itens"); 
+    }
+
+    Reserva reservaAtual;
+    memset(&reservaAtual, 0, sizeof reservaAtual);
+    snprintf(reservaAtual.idTransacao, sizeof reservaAtual.idTransacao, "%s", idTransacao);
+    snprintf(reservaAtual.coordenadorId, sizeof reservaAtual.coordenadorId, "%s", coordenador);
+    
+    const char *passageiro = jsonObterTexto(json, "passageiro");
+    snprintf(reservaAtual.passageiro, sizeof reservaAtual.passageiro, "%s", passageiro ? passageiro : "");
+    snprintf(reservaAtual.anterior, sizeof reservaAtual.anterior, "%s", (remetente && *remetente) ? remetente : coordenador);
+    
+    reservaAtual.relogio = jsonObterInteiro(json, "relogio_logico", 0);
+    reservaAtual.criadoEm = agoraEmSegundos();
+
+    TrechoRes todosTrechos[MAX_TRECHOS_TX];
+    for (int i = 0; i < numTrechos; i++) {
+        const ValorJSON *trechoAtual = jsonObterElemento(listaTrechos, i);
+        const char *servidorTrecho = jsonObterTexto(trechoAtual, "servidor");
+        const char *idCaronaTrecho = jsonObterTexto(trechoAtual, "id_carona");
+        
+        if (!servidorTrecho || !idCaronaTrecho || !identificadorValido(idCaronaTrecho)) { 
+            jsonLiberar(json); 
+            return criarRespostaErro(400, "trecho sem servidor ou com id_carona invalido"); 
+        }
+
+        memset(&todosTrechos[i], 0, sizeof todosTrechos[i]);
+        configuracoesNormalizar(servidorTrecho, todosTrechos[i].servidor, sizeof todosTrechos[i].servidor);
+        snprintf(todosTrechos[i].idCarona, sizeof todosTrechos[i].idCarona, "%s", idCaronaTrecho);
+
+        const char *origemTrecho = jsonObterTexto(trechoAtual, "origem");
+        const char *destinoTrecho = jsonObterTexto(trechoAtual, "destino");
+        if (!origemTrecho || !*origemTrecho || !destinoTrecho || !*destinoTrecho) {
+            jsonLiberar(json);
+            return criarRespostaErro(400, "trecho sem origem ou destino");
+        }
+        snprintf(todosTrechos[i].origem, sizeof todosTrechos[i].origem, "%s", origemTrecho);
+        snprintf(todosTrechos[i].destino, sizeof todosTrechos[i].destino, "%s", destinoTrecho);
+    }
+    jsonLiberar(json);
 
     int k = 0;
-    while (k < n && strcmp(todos[k].servidor, servidor.id) == 0) {
-        for (int q = 0; q < r.qtdLocais; q++) {
-            if (strcmp(r.locais[q].idCarona, todos[k].idCarona) == 0) return respErro(400, "carona repetida na transacao");
+    while (k < numTrechos && strcmp(todosTrechos[k].servidor, servidor.id) == 0) {
+        for (int q = 0; q < reservaAtual.qtdLocais; q++) {
+            if (strcmp(reservaAtual.locais[q].idCarona, todosTrechos[k].idCarona) == 0) {
+                return criarRespostaErro(400, "carona repetida na transacao");
+            }
         }
-        r.locais[r.qtdLocais++] = todos[k++];
+        reservaAtual.locais[reservaAtual.qtdLocais++] = todosTrechos[k++];
     }
-    if (r.qtdLocais == 0) return respErro(400, "O primeiro trecho solicitado nao pertence a este servidor");
+    
+    if (reservaAtual.qtdLocais == 0) return criarRespostaErro(400, "O primeiro trecho solicitado nao pertence a este servidor");
 
-    for (int q = k; q < n; q++) {
-        if (strcmp(todos[q].servidor, servidor.id) == 0) return respErro(400, "Servidor aparece duas vezes na cadeia");
+    for (int q = k; q < numTrechos; q++) {
+        if (strcmp(todosTrechos[q].servidor, servidor.id) == 0) {
+            return criarRespostaErro(400, "Servidor aparece duas vezes na cadeia");
+        }
     }
-    if (k < n) {
-        snprintf(r.proximo, sizeof r.proximo, "%s", todos[k].servidor);
-        if (!buscarVizinho(r.proximo)) return respErro(400, "O proximo servidor da cadeia nao faz fronteira com este");
+    
+    if (k < numTrechos) {
+        snprintf(reservaAtual.proximo, sizeof reservaAtual.proximo, "%s", todosTrechos[k].servidor);
+        if (!buscarVizinho(reservaAtual.proximo)) return criarRespostaErro(400, "O proximo servidor da cadeia nao faz fronteira com este");
     }
 
     printf("[2PC] PREPARE tx=%s coordenador=%s relogio=%d trechos_meus=%d proximo=%s\n",
-           r.idTransacao, r.coordenadorId, r.relogio, r.qtdLocais, r.proximo[0] ? r.proximo : "-");
+           reservaAtual.idTransacao, reservaAtual.coordenadorId, reservaAtual.relogio, reservaAtual.qtdLocais, reservaAtual.proximo[0] ? reservaAtual.proximo : "-");
 
-    int rc = reservaPreparar(&r, ESPERA_MAX_MS);
+    int rc = reservaPreparar(&reservaAtual, ESPERA_MAX_MS);
     if (rc != ARMAZENAMENTO_OK) {
         char motivo[320];
-        motivoReserva(motivo, sizeof motivo, rc, &r);
-        return negar(rc == ARMAZENAMENTO_NAO_ENCONTRADO ? 404 : rc == ARMAZENAMENTO_INDISPONIVEL ? 409 : 500, id, motivo);
+        motivoReserva(motivo, sizeof motivo, rc, &reservaAtual);
+
+        return negarAcesso(httpDeRc(rc), idTransacao, motivo);
     }
 
-    TrechoRes agr[MAX_TRECHOS_TX];
-    int nAgr = 0;
-    for (int q = 0; q < r.qtdLocais && nAgr < MAX_TRECHOS_TX; q++) agr[nAgr++] = r.locais[q];
+    TrechoRes agrupamento[MAX_TRECHOS_TX];
+    int qtdAgrupamento = 0;
+    for (int q = 0; q < reservaAtual.qtdLocais && qtdAgrupamento < MAX_TRECHOS_TX; q++) {
+        agrupamento[qtdAgrupamento++] = reservaAtual.locais[q];
+    }
 
-    if (!r.jaExistia && r.proximo[0]) {
-        Falha f;
-        if (encaminharPrepare(&r, &todos[k], n - k, agr, &nAgr, &f) != 0) {
-            reservaRemover(id);
-            if (f.falhaRede) propagar("rollback", r.proximo, id);
-            printf("[2PC] PREPARE tx=%s abortado aqui: %s\n", id, f.motivo);
-            return negar(f.http, id, f.motivo);
+    if (!reservaAtual.jaExistia && reservaAtual.proximo[0]) {
+        Falha falhaRede;
+        if (encaminharPrepare(&reservaAtual, &todosTrechos[k], numTrechos - k, agrupamento, &qtdAgrupamento, &falhaRede) != 0) {
+            reservaRemover(idTransacao);
+            if (falhaRede.falhaRede) propagarComando("rollback", reservaAtual.proximo, idTransacao);
+            printf("[2PC] PREPARE tx=%s abortado aqui: %s\n", idTransacao, falhaRede.motivo);
+            return negarAcesso(falhaRede.http, idTransacao, falhaRede.motivo);
         }
     }
 
-    if (!r.jaExistia) reservaAtivo(id, 0);
+    if (!reservaAtual.jaExistia) reservaAtivo(idTransacao, 0);
 
-    Buf b; bufIni(&b);
-    bufAdd(&b, "{\"id_transacao\": "); bufStr(&b, id);
-    bufAdd(&b, ", \"status\": \"READY\", \"servidor\": "); bufStr(&b, servidor.id);
-    bufAdd(&b, ", \"assentos\": ");
-    assentosJSON(&b, agr, nAgr);
-    bufAdd(&b, "}\n");
-    return respJSON(200, bufTomar(&b));
+    Buffer buffer; 
+    bufferIniciar(&buffer);
+    bufferAdicionar(&buffer, "{\"id_transacao\": "); 
+    bufferAdicionarStringJSON(&buffer, idTransacao);
+    
+    bufferAdicionar(&buffer, ", \"status\": \"READY\", \"servidor\": "); 
+    bufferAdicionarStringJSON(&buffer, servidor.id);
+    
+    bufferAdicionar(&buffer, ", \"assentos\": ");
+    assentosJSON(&buffer, agrupamento, qtdAgrupamento);
+    bufferAdicionar(&buffer, "}\n");
+    
+    return criarRespostaJSON(200, bufferExtrairTexto(&buffer));
 }
 
-Resp txCommit(const char *id) {
-    printf("[2PC] COMMIT tx=%s\n", id);
+/*
+ * PARTICIPANTE, fase 2: confirma a reserva (PUT /reservas/{id}/commit).
+ * Grava COMITADO em disco e repassa o commit ao próximo servidor da cadeia.
+ * Retorna 200 (com "propagacao_pendente" = true se o próximo não recebeu;
+ * ele se resolve na recuperação), 404 se não houve prepare ou 500 em falha de disco.
+ */
+RespostaServidor txCommit(const char *idTransacao) {
+    printf("[2PC] COMMIT tx=%s\n", idTransacao);
 
-    Reserva r;
-    if (reservaBuscar(id, &r) != ARMAZENAMENTO_OK) {
-        return respErro(404, "Transacao desconhecida (nao houve prepare)");
+    Reserva reservaAtual;
+    if (reservaBuscar(idTransacao, &reservaAtual) != ARMAZENAMENTO_OK) {
+        return criarRespostaErro(404, "Transacao desconhecida (nao houve prepare)");
     }
 
-    if (reservaDecidir(id, "COMITADO", NULL, 0) != ARMAZENAMENTO_OK) {
-        return respErro(500, "Falha ao gravar a reserva em disco");
+    if (reservaDecidir(idTransacao, "COMITADO", NULL, 0) != ARMAZENAMENTO_OK) {
+        return criarRespostaErro(500, "Falha ao gravar a reserva em disco");
     }
 
-    int pendente = (propagar("commit", r.proximo, id) != 0);
+    int propagacaoPendente = (propagarComando("commit", reservaAtual.proximo, idTransacao) != 0);
 
-    Buf b; bufIni(&b);
-    bufAdd(&b, "{\"id_transacao\": "); bufStr(&b, id);
-    bufAdd(&b, ", \"mensagem\": \"Transacao COMMITTED com sucesso.\", \"propagacao_pendente\": %s}\n",
-           pendente ? "true" : "false");
-    return respJSON(200, bufTomar(&b));
+    Buffer buffer; 
+    bufferIniciar(&buffer);
+    bufferAdicionar(&buffer, "{\"id_transacao\": "); 
+    bufferAdicionarStringJSON(&buffer, idTransacao);
+    bufferAdicionar(&buffer, ", \"mensagem\": \"Transacao COMMITTED com sucesso.\", \"propagacao_pendente\": %s}\n",
+           propagacaoPendente ? "true" : "false");
+           
+    return criarRespostaJSON(200, bufferExtrairTexto(&buffer));
 }
 
-Resp txRollback(const char *id) {
-    printf("[2PC] ROLLBACK tx=%s\n", id);
+/*
+ * PARTICIPANTE, fase 2 (abortar): desfaz a reserva preparada
+ * (DELETE /reservas/{id}) e repassa o rollback ao próximo servidor.
+ * Retorna 200 (também se a transação não existia: o rollback é idempotente),
+ * 409 se a reserva já foi COMITADA, ou 500 em falha de disco.
+ */
+RespostaServidor txRollback(const char *idTransacao) {
+    printf("[2PC] ROLLBACK tx=%s\n", idTransacao);
 
-    Reserva r;
-    int tinha = (reservaBuscar(id, &r) == ARMAZENAMENTO_OK);
+    Reserva reservaAtual;
+    int transacaoExistia = (reservaBuscar(idTransacao, &reservaAtual) == ARMAZENAMENTO_OK);
 
-    int rc = reservaRemover(id);
-    if (rc == ARMAZENAMENTO_CONFLITO) return respErro(409, "Transacao ja COMITADA: rollback recusado");
-    if (rc == ARMAZENAMENTO_ERRO) return respErro(500, "Falha ao gravar a remocao em disco");
+    int rc = reservaRemover(idTransacao);
+    if (rc == ARMAZENAMENTO_CONFLITO) return criarRespostaErro(409, "Transacao ja COMITADA: rollback recusado");
+    if (rc == ARMAZENAMENTO_ERRO) return criarRespostaErro(500, "Falha ao gravar a remocao em disco");
 
-    if (tinha) propagar("rollback", r.proximo, id);
+    if (transacaoExistia) propagarComando("rollback", reservaAtual.proximo, idTransacao);
 
-    Buf b; bufIni(&b);
-    bufAdd(&b, "{\"id_transacao\": "); bufStr(&b, id);
-    bufAdd(&b, ", \"mensagem\": \"Transacao ABORTED com sucesso.\"}\n");
-    return respJSON(200, bufTomar(&b));
+    Buffer buffer; 
+    bufferIniciar(&buffer);
+    bufferAdicionar(&buffer, "{\"id_transacao\": "); 
+    bufferAdicionarStringJSON(&buffer, idTransacao);
+    bufferAdicionar(&buffer, ", \"mensagem\": \"Transacao ABORTED com sucesso.\"}\n");
+    
+    return criarRespostaJSON(200, bufferExtrairTexto(&buffer));
 }
 
-Resp txStatus(const char *id) {
-    Reserva r;
-    if (reservaBuscar(id, &r) != ARMAZENAMENTO_OK) return respErro(404, "Transacao desconhecida");
+/*
+ * Informa o estado de uma transação (GET /reservas/{id}/status).
+ * É a pergunta que a recuperação faz ao servidor anterior da cadeia.
+ * Retorna 200 com {"status": <estado>, "coordenador_id"} ou 404 se desconhecida.
+ */
+RespostaServidor txStatus(const char *idTransacao) {
+    Reserva reservaAtual;
+    if (reservaBuscar(idTransacao, &reservaAtual) != ARMAZENAMENTO_OK) return criarRespostaErro(404, "Transacao desconhecida");
 
-    Buf b; bufIni(&b);
-    bufAdd(&b, "{\"id_transacao\": "); bufStr(&b, id);
-    bufAdd(&b, ", \"status\": ");      bufStr(&b, r.estado);
-    bufAdd(&b, ", \"coordenador_id\": "); bufStr(&b, r.coordenadorId);
-    bufAdd(&b, "}\n");
-    return respJSON(200, bufTomar(&b));
+    Buffer buffer; 
+    bufferIniciar(&buffer);
+    
+    bufferAdicionar(&buffer, "{\"id_transacao\": "); 
+    bufferAdicionarStringJSON(&buffer, idTransacao);
+    
+    bufferAdicionar(&buffer, ", \"status\": ");      
+    bufferAdicionarStringJSON(&buffer, reservaAtual.estado);
+    
+    bufferAdicionar(&buffer, ", \"coordenador_id\": "); 
+    bufferAdicionarStringJSON(&buffer, reservaAtual.coordenadorId);
+    bufferAdicionar(&buffer, "}\n");
+    
+    return criarRespostaJSON(200, bufferExtrairTexto(&buffer));
 }
 
-static Resp recusado(unsigned int http, const char *motivo) {
-    Buf b; bufIni(&b);
-    bufAdd(&b, "{\"status\": \"RECUSADO\", \"motivo\": ");
-    bufStr(&b, motivo);
-    bufAdd(&b, "}\n");
-    return respJSON(http, bufTomar(&b));
+/*
+ * Monta a resposta de recusa enviada ao passageiro: {"status": "RECUSADO", "motivo"}.
+ */
+static RespostaServidor respostaRecusada(unsigned int http, const char *motivo) {
+    Buffer buffer; 
+    bufferIniciar(&buffer);
+    
+    bufferAdicionar(&buffer, "{\"status\": \"RECUSADO\", \"motivo\": ");
+    bufferAdicionarStringJSON(&buffer, motivo);
+    bufferAdicionar(&buffer, "}\n");
+    
+    return criarRespostaJSON(http, bufferExtrairTexto(&buffer));
 }
 
-Resp txReservarComo(const char *forcado, const char *corpo) {
-    JVal *j = corpo ? jsonParse(corpo) : NULL;
-    if (!j) return respErro(400, "Corpo JSON invalido");
+/*
+ * COORDENADOR: reserva um itinerário completo para um passageiro (POST /reservas).
+ *   - forcado: id do passageiro vindo da autenticação (sobrescreve o do corpo);
+ *     NULL usa o campo "passageiro" do corpo
+ *   - corpo: {"passageiro", "trechos": [{"servidor", "id_carona", "origem", "destino"}, ...]}
+ * Valida o itinerário (trechos deste servidor primeiro, cadeia de servidores
+ * seguindo o mapa de fronteiras, sem caronas repetidas), reserva os assentos
+ * locais, encaminha o prepare, decide o commit e o propaga.
+ * Retorna 201 {"status": "CONFIRMADO", ...} se deu certo; senão 400/403/404 (pedido
+ * inválido) ou a resposta RECUSADO com 404/409/502 conforme o motivo. Nesse caso
+ * nada fica reservado.
+ */
+RespostaServidor txReservarComo(const char *forcado, const char *corpo) {
+    ValorJSON *json = corpo ? jsonAnalisar(corpo) : NULL;
+    if (!json) return criarRespostaErro(400, "Corpo JSON invalido");
 
-    char pass[64] = "";
-    if (jsonGetStr(j, "passageiro")) snprintf(pass, sizeof pass, "%s", jsonGetStr(j, "passageiro"));
-    if (forcado) snprintf(pass, sizeof pass, "%s", forcado);
-    const JVal *lista = jsonGet(j, "trechos");
-    int n = jsonTam(lista);
+    char passageiroFinal[64] = "";
+    const char *passJSON = jsonObterTexto(json, "passageiro");
+    if (passJSON) snprintf(passageiroFinal, sizeof passageiroFinal, "%s", passJSON);
+    if (forcado) snprintf(passageiroFinal, sizeof passageiroFinal, "%s", forcado);
+    
+    const ValorJSON *listaTrechos = jsonObterCampo(json, "trechos");
+    int numTrechos = jsonTamanhoArray(listaTrechos);
 
-    Usuario u;
-    if (!pass[0] || !idValido(pass)) { jsonLiberar(j); return respErro(400, "Informe o passageiro"); }
-    if (usuarioBuscar(pass, &u) != ARMAZENAMENTO_OK) { jsonLiberar(j); return respErro(404, "Passageiro nao cadastrado neste servidor"); }
-    if (strcmp(u.tipo, "passageiro") != 0) { jsonLiberar(j); return respErro(403, "O usuario informado nao e passageiro"); }
-    if (n < 1 || n > MAX_TRECHOS_TX) { jsonLiberar(j); return respErro(400, "trechos deve ter de 1 a 8 itens"); }
+    Usuario usuarioPassageiro;
+    if (!passageiroFinal[0] || !identificadorValido(passageiroFinal)) { 
+        jsonLiberar(json); 
+        return criarRespostaErro(400, "Informe o passageiro"); 
+    }
+    if (usuarioBuscar(passageiroFinal, &usuarioPassageiro) != ARMAZENAMENTO_OK) { 
+        jsonLiberar(json); 
+        return criarRespostaErro(404, "Passageiro nao cadastrado neste servidor"); 
+    }
+    if (strcmp(usuarioPassageiro.tipo, "passageiro") != 0) { 
+        jsonLiberar(json); 
+        return criarRespostaErro(403, "O usuario informado nao e passageiro"); 
+    }
+    if (numTrechos < 1 || numTrechos > MAX_TRECHOS_TX) { 
+        jsonLiberar(json); 
+        return criarRespostaErro(400, "trechos deve ter de 1 a 8 itens"); 
+    }
 
-    TrechoRes t[MAX_TRECHOS_TX];
-    for (int i = 0; i < n; i++) {
-        const JVal *it = jsonIdx(lista, i);
-        const char *srv = jsonGetStr(it, "servidor"), *idc = jsonGetStr(it, "id_carona");
-        if (!srv || !idc || !idValido(idc)) { jsonLiberar(j); return respErro(400, "Trecho sem servidor ou com id_carona invalido"); }
+    TrechoRes trechosParsed[MAX_TRECHOS_TX];
+    for (int i = 0; i < numTrechos; i++) {
+        const ValorJSON *itemTrecho = jsonObterElemento(listaTrechos, i);
+        const char *servidorAlvo = jsonObterTexto(itemTrecho, "servidor");
+        const char *idCaronaAlvo = jsonObterTexto(itemTrecho, "id_carona");
+        
+        if (!servidorAlvo || !idCaronaAlvo || !identificadorValido(idCaronaAlvo)) { 
+            jsonLiberar(json); 
+            return criarRespostaErro(400, "Trecho sem servidor ou com id_carona invalido"); 
+        }
 
-        memset(&t[i], 0, sizeof t[i]);
-        configuracoesNormalizar(srv, t[i].servidor, sizeof t[i].servidor);
-        snprintf(t[i].idCarona, sizeof t[i].idCarona, "%s", idc);
+        memset(&trechosParsed[i], 0, sizeof trechosParsed[i]);
+        configuracoesNormalizar(servidorAlvo, trechosParsed[i].servidor, sizeof trechosParsed[i].servidor);
+        snprintf(trechosParsed[i].idCarona, sizeof trechosParsed[i].idCarona, "%s", idCaronaAlvo);
 
-        if (!configuracoesRegiaoValida(t[i].servidor)) { jsonLiberar(j); return respErro(400, "Servidor desconhecido em um dos trechos"); }
+        const char *origemTrecho = jsonObterTexto(itemTrecho, "origem");
+        const char *destinoTrecho = jsonObterTexto(itemTrecho, "destino");
+        if (!origemTrecho || !*origemTrecho || !destinoTrecho || !*destinoTrecho) {
+            jsonLiberar(json);
+            return criarRespostaErro(400, "Trecho sem origem ou destino");
+        }
+        snprintf(trechosParsed[i].origem, sizeof trechosParsed[i].origem, "%s", origemTrecho);
+        snprintf(trechosParsed[i].destino, sizeof trechosParsed[i].destino, "%s", destinoTrecho);
+
+        if (!configuracoesRegiaoValida(trechosParsed[i].servidor)) { 
+            jsonLiberar(json); 
+            return criarRespostaErro(400, "Servidor desconhecido em um dos trechos"); 
+        }
         for (int q = 0; q < i; q++) {
-            if (strcmp(t[q].idCarona, t[i].idCarona) == 0 && strcmp(t[q].servidor, t[i].servidor) == 0) {
-                jsonLiberar(j); return respErro(400, "Carona repetida no itinerario");
+            if (strcmp(trechosParsed[q].idCarona, trechosParsed[i].idCarona) == 0 && strcmp(trechosParsed[q].servidor, trechosParsed[i].servidor) == 0) {
+                jsonLiberar(json); 
+                return criarRespostaErro(400, "Carona repetida no itinerario");
             }
         }
     }
-    jsonLiberar(j);
+    jsonLiberar(json);
 
-    const char *prev = servidor.id;
-    char vistos[MAX_TRECHOS_TX][MAX_ID];
-    int nv = 0;
-    for (int i = 0; i < n; i++) {
-        if (i > 0 && strcmp(t[i].servidor, t[i - 1].servidor) == 0) continue;
+    const char *servidorAnterior = servidor.id;
+    char servidoresVisitados[MAX_TRECHOS_TX][MAX_ID];
+    int qtdVisitados = 0;
+    
+    for (int i = 0; i < numTrechos; i++) {
+        if (i > 0 && strcmp(trechosParsed[i].servidor, trechosParsed[i - 1].servidor) == 0) continue;
 
-        for (int q = 0; q < nv; q++) if (strcmp(vistos[q], t[i].servidor) == 0) return respErro(400, "Servidor repetido de forma nao consecutiva no itinerario");
-        snprintf(vistos[nv++], MAX_ID, "%s", t[i].servidor);
-
-        if (strcmp(t[i].servidor, servidor.id) == 0) {
-            if (i != 0) return respErro(400, "Os trechos deste servidor devem vir primeiro no itinerario");
-        } else if (!configuracoesSaoVizinhas(prev, t[i].servidor)) {
-            char m[260];
-            snprintf(m, sizeof m, "%s e %s nao fazem fronteira: a cadeia de participantes deve seguir o mapa", prev, t[i].servidor);
-            return respErro(400, m);
+        for (int q = 0; q < qtdVisitados; q++) {
+            if (strcmp(servidoresVisitados[q], trechosParsed[i].servidor) == 0) {
+                return criarRespostaErro(400, "Servidor repetido de forma nao consecutiva no itinerario");
+            }
         }
-        prev = t[i].servidor;
+        snprintf(servidoresVisitados[qtdVisitados++], MAX_ID, "%s", trechosParsed[i].servidor);
+
+        if (strcmp(trechosParsed[i].servidor, servidor.id) == 0) {
+            if (i != 0) return criarRespostaErro(400, "Os trechos deste servidor devem vir primeiro no itinerario");
+        } else if (!configuracoesSaoVizinhas(servidorAnterior, trechosParsed[i].servidor)) {
+            char mensagem[260];
+            snprintf(mensagem, sizeof mensagem, "%s e %s nao fazem fronteira: a cadeia de participantes deve seguir o mapa", servidorAnterior, trechosParsed[i].servidor);
+            return criarRespostaErro(400, mensagem);
+        }
+        servidorAnterior = trechosParsed[i].servidor;
     }
 
-    Reserva r;
-    memset(&r, 0, sizeof r);
-    gerarUUID(r.idTransacao);
-    snprintf(r.coordenadorId, sizeof r.coordenadorId, "%s", servidor.id);
-    snprintf(r.passageiro, sizeof r.passageiro, "%s", pass);
-    r.relogio = lamportTique();
-    r.criadoEm = agoraSegundos();
+    Reserva reservaAtual;
+    memset(&reservaAtual, 0, sizeof reservaAtual);
+    gerarUUID(reservaAtual.idTransacao);
+    snprintf(reservaAtual.coordenadorId, sizeof reservaAtual.coordenadorId, "%s", servidor.id);
+    snprintf(reservaAtual.passageiro, sizeof reservaAtual.passageiro, "%s", passageiroFinal);
+    reservaAtual.relogio = lamportIncrementar();
+    reservaAtual.criadoEm = agoraEmSegundos();
 
     int k = 0;
-    while (k < n && strcmp(t[k].servidor, servidor.id) == 0) r.locais[r.qtdLocais++] = t[k++];
-    if (k < n) snprintf(r.proximo, sizeof r.proximo, "%s", t[k].servidor);
-    for (int i = 0; i < n; i++) r.itin[r.qtdItin++] = t[i];
+    while (k < numTrechos && strcmp(trechosParsed[k].servidor, servidor.id) == 0) reservaAtual.locais[reservaAtual.qtdLocais++] = trechosParsed[k++];
+    if (k < numTrechos) snprintf(reservaAtual.proximo, sizeof reservaAtual.proximo, "%s", trechosParsed[k].servidor);
+    for (int i = 0; i < numTrechos; i++) reservaAtual.itin[reservaAtual.qtdItin++] = trechosParsed[i];
 
     printf("[2PC] RESERVAR tx=%s passageiro=%s relogio=%d trechos=%d (locais=%d)\n",
-           r.idTransacao, pass, r.relogio, n, r.qtdLocais);
+           reservaAtual.idTransacao, passageiroFinal, reservaAtual.relogio, numTrechos, reservaAtual.qtdLocais);
 
-    int rc = reservaPreparar(&r, ESPERA_MAX_MS);
+    int rc = reservaPreparar(&reservaAtual, ESPERA_MAX_MS);
     if (rc != ARMAZENAMENTO_OK) {
         char motivo[320];
-        motivoReserva(motivo, sizeof motivo, rc, &r);
-        return recusado(rc == ARMAZENAMENTO_NAO_ENCONTRADO ? 404 : rc == ARMAZENAMENTO_INDISPONIVEL ? 409 : 500, motivo);
+        motivoReserva(motivo, sizeof motivo, rc, &reservaAtual);
+        return respostaRecusada(httpDeRc(rc), motivo);
     }
 
-    TrechoRes agr[MAX_TRECHOS_TX];
-    int nAgr = 0;
-    for (int q = 0; q < r.qtdLocais; q++) agr[nAgr++] = r.locais[q];
+    TrechoRes agrupamento[MAX_TRECHOS_TX];
+    int qtdAgrupamento = 0;
+    for (int q = 0; q < reservaAtual.qtdLocais; q++) agrupamento[qtdAgrupamento++] = reservaAtual.locais[q];
 
-    if (k < n) {
-        Falha f;
-        if (encaminharPrepare(&r, &t[k], n - k, agr, &nAgr, &f) != 0) {
-            reservaRemover(r.idTransacao);
-            if (f.falhaRede) propagar("rollback", r.proximo, r.idTransacao);
-            printf("[2PC] tx=%s ABORTADA: %s\n", r.idTransacao, f.motivo);
-            return recusado(f.http, f.motivo);
+    if (k < numTrechos) {
+        Falha falhaRede;
+        if (encaminharPrepare(&reservaAtual, &trechosParsed[k], numTrechos - k, agrupamento, &qtdAgrupamento, &falhaRede) != 0) {
+            reservaRemover(reservaAtual.idTransacao);
+            if (falhaRede.falhaRede) propagarComando("rollback", reservaAtual.proximo, reservaAtual.idTransacao);
+            printf("[2PC] tx=%s ABORTADA: %s\n", reservaAtual.idTransacao, falhaRede.motivo);
+            return respostaRecusada(falhaRede.http, falhaRede.motivo);
         }
     }
 
     injetarFalha("antes_decisao");
 
-    if (reservaDecidir(r.idTransacao, "COMITADO", agr, nAgr) != ARMAZENAMENTO_OK) {
-        reservaRemover(r.idTransacao);
-        propagar("rollback", r.proximo, r.idTransacao);
-        return recusado(500, "Falha ao gravar a decisao em disco");
+    if (reservaDecidir(reservaAtual.idTransacao, "COMITADO", agrupamento, qtdAgrupamento) != ARMAZENAMENTO_OK) {
+        reservaRemover(reservaAtual.idTransacao);
+        propagarComando("rollback", reservaAtual.proximo, reservaAtual.idTransacao);
+        return respostaRecusada(500, "Falha ao gravar a decisao em disco");
     }
-    reservaAtivo(r.idTransacao, 0);
-    printf("[2PC] tx=%s DECIDIDA: COMMIT\n", r.idTransacao);
+    reservaAtivo(reservaAtual.idTransacao, 0);
+    printf("[2PC] tx=%s DECIDIDA: COMMIT\n", reservaAtual.idTransacao);
 
     injetarFalha("depois_decisao");
 
-    int pendente = (propagar("commit", r.proximo, r.idTransacao) != 0);
+    int propagacaoPendente = (propagarComando("commit", reservaAtual.proximo, reservaAtual.idTransacao) != 0);
 
-    Buf b; bufIni(&b);
-    bufAdd(&b, "{\"id_transacao\": "); bufStr(&b, r.idTransacao);
-    bufAdd(&b, ", \"status\": \"CONFIRMADO\", \"passageiro\": "); bufStr(&b, pass);
-    bufAdd(&b, ", \"relogio_logico\": %d, \"propagacao_pendente\": %s, \"trechos\": ",
-           r.relogio, pendente ? "true" : "false");
-    assentosJSON(&b, agr, nAgr);
-    bufAdd(&b, "}\n");
-    return respJSON(201, bufTomar(&b));
+    Buffer buffer; 
+    bufferIniciar(&buffer);
+    bufferAdicionar(&buffer, "{\"id_transacao\": "); 
+    bufferAdicionarStringJSON(&buffer, reservaAtual.idTransacao);
+    
+    bufferAdicionar(&buffer, ", \"status\": \"CONFIRMADO\", \"passageiro\": "); 
+    bufferAdicionarStringJSON(&buffer, passageiroFinal);
+    
+    bufferAdicionar(&buffer, ", \"relogio_logico\": %d, \"propagacao_pendente\": %s, \"trechos\": ",
+           reservaAtual.relogio, propagacaoPendente ? "true" : "false");
+           
+    assentosJSON(&buffer, agrupamento, qtdAgrupamento);
+    bufferAdicionar(&buffer, "}\n");
+    return criarRespostaJSON(201, bufferExtrairTexto(&buffer));
 }
 
-Resp txReservar(const char *corpo) { return txReservarComo(NULL, corpo); }
+/*
+ * COORDENADOR: atalho de txReservarComo em que o passageiro vem do corpo JSON.
+ */
+RespostaServidor txReservar(const char *corpo) { 
+    return txReservarComo(NULL, corpo); 
+}
 
-static int enviarCancel(const char *proximo, const char *id) {
+/*
+ * Pede ao próximo servidor que cancele a reserva (PUT /reservas/{id}/cancel).
+ * Retorna 0 se concluído (ou se não há próximo), -1 se não foi possível.
+ */
+static int enviarCancelamento(const char *proximo, const char *idTransacao) {
     if (!proximo[0]) return 0;
 
     Resposta resp;
-    int rc = clienteCancelar(proximo, id, &resp);
+    int rc = clienteCancelar(proximo, idTransacao, &resp);
     int entregue = (rc == 0 && resp.codigoHTTP == 200);
 
     if (!entregue) {
-        printf("[2PC] cancel de %s NAO concluido em %s (%s)\n", id, proximo,
-               rc != 0 ? resp.erro : "resposta != 200");
+        printf("[2PC] cancel de %s NAO concluido em %s (%s)\n", idTransacao, proximo, rc != 0 ? resp.erro : "resposta != 200");
     }
     respostaLiberar(&resp);
     return entregue ? 0 : -1;
 }
 
-static int cancelarCadeia(const Reserva *r) {
-    if (enviarCancel(r->proximo, r->idTransacao) != 0) return -1;
-    int rc = reservaApagar(r->idTransacao);
+/*
+ * Cancela a reserva na cadeia: primeiro os servidores à frente, depois apaga a
+ * cópia local (só apaga se os da frente confirmaram, para nunca perder o rastro).
+ * Retorna 0 se tudo foi cancelado, -1 se algum servidor não respondeu
+ * (a reserva fica em CANCELANDO e a recuperação tenta de novo).
+ */
+static int cancelarCadeia(const Reserva *reserva) {
+    if (enviarCancelamento(reserva->proximo, reserva->idTransacao) != 0) return -1;
+    
+    int rc = reservaApagar(reserva->idTransacao);
     return (rc == ARMAZENAMENTO_OK || rc == ARMAZENAMENTO_NAO_ENCONTRADO) ? 0 : -1;
 }
 
-Resp txCancel(const char *id) {
-    printf("[2PC] CANCEL tx=%s\n", id);
+/*
+ * PARTICIPANTE: cancela uma reserva já confirmada (PUT /reservas/{id}/cancel).
+ * Passa o cancelamento adiante e depois apaga a reserva local.
+ * Idempotente: se a reserva não existe, responde 200 ("Ja cancelada aqui").
+ * Retorna 503 se não conseguiu concluir adiante (o chamador pode tentar de novo).
+ */
+RespostaServidor txCancel(const char *idTransacao) {
+    printf("[2PC] CANCEL tx=%s\n", idTransacao);
 
-    Reserva r;
-    Buf b; bufIni(&b);
-    bufAdd(&b, "{\"id_transacao\": "); bufStr(&b, id);
+    Reserva reservaAtual;
+    Buffer buffer; 
+    bufferIniciar(&buffer);
+    
+    bufferAdicionar(&buffer, "{\"id_transacao\": "); 
+    bufferAdicionarStringJSON(&buffer, idTransacao);
 
-    if (reservaBuscar(id, &r) != ARMAZENAMENTO_OK) {
-        bufAdd(&b, ", \"mensagem\": \"Ja cancelada aqui.\"}\n");
-        return respJSON(200, bufTomar(&b));
+    if (reservaBuscar(idTransacao, &reservaAtual) != ARMAZENAMENTO_OK) {
+        bufferAdicionar(&buffer, ", \"mensagem\": \"Ja cancelada aqui.\"}\n");
+        return criarRespostaJSON(200, bufferExtrairTexto(&buffer));
     }
 
-    if (cancelarCadeia(&r) != 0) {
-        bufLiberar(&b);
-        return respErro(503, "Nao consegui concluir o cancelamento adiante; tente de novo");
+    if (cancelarCadeia(&reservaAtual) != 0) {
+        bufferLiberar(&buffer);
+        return criarRespostaErro(503, "Nao consegui concluir o cancelamento adiante; tente de novo");
     }
 
-    bufAdd(&b, ", \"mensagem\": \"Reserva CANCELADA.\"}\n");
-    return respJSON(200, bufTomar(&b));
+    bufferAdicionar(&buffer, ", \"mensagem\": \"Reserva CANCELADA.\"}\n");
+    return criarRespostaJSON(200, bufferExtrairTexto(&buffer));
 }
 
-Resp txCancelar(const char *id, const char *passageiro) {
-    Reserva r;
+/*
+ * COORDENADOR: cancelamento pedido pelo passageiro (DELETE /reservas/{id}).
+ * Só o servidor coordenador e o dono da reserva podem cancelar. Primeiro grava
+ * CANCELANDO em disco (a decisão), depois propaga pela cadeia.
+ * Retorna 200 {"status": "CANCELADA"} se todos cancelaram, 202 {"status": "CANCELANDO"}
+ * se algum servidor está fora do ar (a recuperação conclui depois), 404 se a reserva
+ * não é dele, 409 se a reserva ainda está em andamento ou 500 em falha de disco.
+ */
+RespostaServidor txCancelar(const char *idTransacao, const char *passageiro) {
+    Reserva reservaAtual;
 
-    if (!id || !passageiro || reservaBuscar(id, &r) != ARMAZENAMENTO_OK ||
-        strcmp(r.coordenadorId, servidor.id) != 0 || strcmp(r.passageiro, passageiro) != 0) {
-        return respErro(404, "Reserva nao encontrada");
+    if (!idTransacao || !passageiro || reservaBuscar(idTransacao, &reservaAtual) != ARMAZENAMENTO_OK ||
+        strcmp(reservaAtual.coordenadorId, servidor.id) != 0 || strcmp(reservaAtual.passageiro, passageiro) != 0) {
+        return criarRespostaErro(404, "Reserva nao encontrada");
     }
 
-    if (strcmp(r.estado, "PREPARADO") == 0) {
-        return respErro(409, "Reserva ainda em andamento; tente de novo em instantes");
+    if (strcmp(reservaAtual.estado, "PREPARADO") == 0) {
+        return criarRespostaErro(409, "Reserva ainda em andamento; tente de novo em instantes");
     }
 
-    if (strcmp(r.estado, "COMITADO") == 0) {
-        if (reservaDecidir(id, "CANCELANDO", NULL, 0) != ARMAZENAMENTO_OK) {
-            return respErro(500, "Falha ao gravar o cancelamento em disco");
+    if (strcmp(reservaAtual.estado, "COMITADO") == 0) {
+        if (reservaDecidir(idTransacao, "CANCELANDO", NULL, 0) != ARMAZENAMENTO_OK) {
+            return criarRespostaErro(500, "Falha ao gravar o cancelamento em disco");
         }
-        printf("[2PC] tx=%s CANCELAMENTO decidido (CANCELANDO)\n", id);
+        printf("[2PC] tx=%s CANCELAMENTO decidido (CANCELANDO)\n", idTransacao);
         injetarFalha("depois_cancelando");
     }
 
-    Buf b; bufIni(&b);
-    bufAdd(&b, "{\"id_transacao\": "); bufStr(&b, id);
+    Buffer buffer; 
+    bufferIniciar(&buffer);
+    bufferAdicionar(&buffer, "{\"id_transacao\": "); 
+    bufferAdicionarStringJSON(&buffer, idTransacao);
 
-    if (cancelarCadeia(&r) == 0) {
-        printf("[2PC] tx=%s CANCELADA\n", id);
-        bufAdd(&b, ", \"status\": \"CANCELADA\"}\n");
-        return respJSON(200, bufTomar(&b));
+    if (cancelarCadeia(&reservaAtual) == 0) {
+        printf("[2PC] tx=%s CANCELADA\n", idTransacao);
+        bufferAdicionar(&buffer, ", \"status\": \"CANCELADA\"}\n");
+        return criarRespostaJSON(200, bufferExtrairTexto(&buffer));
     }
 
-    bufAdd(&b, ", \"status\": \"CANCELANDO\", \"mensagem\": \"Alguma empresa do trajeto esta fora do ar. "
+    bufferAdicionar(&buffer, ", \"status\": \"CANCELANDO\", \"mensagem\": \"Alguma empresa do trajeto esta fora do ar. "
                "O cancelamento esta registrado e sera concluido automaticamente.\"}\n");
-    return respJSON(202, bufTomar(&b));
+    return criarRespostaJSON(202, bufferExtrairTexto(&buffer));
 }
 
-static pthread_t thRecuperacao;
-static volatile int recuperando = 0;
+/* Thread de Recuperação (Recovery) */
 
-static void resolver(const Reserva *r) {
-    const char *id = r->idTransacao;
+static pthread_t threadRecuperacao;
+static volatile int sistemaRecuperando = 0;   /* 1 enquanto a thread deve continuar rodando */
 
-    if (strcmp(r->coordenadorId, servidor.id) == 0) {
-        printf("[RECUPERACAO] tx=%s: sou o coordenador e nao ha decisao COMMIT -> abortando\n", id);
-        if (reservaRemover(id) == ARMAZENAMENTO_OK) propagar("rollback", r->proximo, id);
+/*
+ * Resolve UMA reserva que ficou PREPARADO por tempo demais (sem decisão).
+ *   - Se este servidor é o coordenador: não há decisão de commit gravada, então
+ *     aborta (rollback local e adiante).
+ *   - Se é participante: pergunta o estado ao servidor anterior da cadeia.
+ *       404 -> o anterior não conhece: aborta aqui e adiante
+ *       COMITADO -> confirma aqui e adiante
+ *       sem resposta ou outro estado -> não faz nada, tenta no próximo ciclo
+ */
+static void resolverTransacaoPendente(const Reserva *reserva) {
+    const char *idTransacao = reserva->idTransacao;
+
+    if (strcmp(reserva->coordenadorId, servidor.id) == 0) {
+        printf("[RECUPERACAO] tx=%s: sou o coordenador e nao ha decisao COMMIT -> abortando\n", idTransacao);
+        if (reservaRemover(idTransacao) == ARMAZENAMENTO_OK) propagarComando("rollback", reserva->proximo, idTransacao);
         return;
     }
 
     Resposta resp;
-    int rc = clienteStatus(r->anterior, id, &resp);
+    int rc = clienteStatus(reserva->anterior, idTransacao, &resp);
 
     if (rc != 0) {
-        printf("[RECUPERACAO] tx=%s: %s sem resposta (%s); tento de novo depois\n", id, r->anterior, resp.erro);
+        printf("[RECUPERACAO] tx=%s: %s sem resposta (%s); tento de novo depois\n", idTransacao, reserva->anterior, resp.erro);
         respostaLiberar(&resp);
         return;
     }
 
     if (resp.codigoHTTP == 404) {
-        printf("[RECUPERACAO] tx=%s: %s nao conhece a transacao -> abortando aqui\n", id, r->anterior);
-        if (reservaRemover(id) == ARMAZENAMENTO_OK) propagar("rollback", r->proximo, id);
+        printf("[RECUPERACAO] tx=%s: %s nao conhece a transacao -> abortando aqui\n", idTransacao, reserva->anterior);
+        if (reservaRemover(idTransacao) == ARMAZENAMENTO_OK) propagarComando("rollback", reserva->proximo, idTransacao);
     } else if (resp.codigoHTTP == 200) {
-        JVal *j = jsonParse(resp.corpo);
-        const char *st = jsonGetStr(j, "status");
+        ValorJSON *jsonResp = jsonAnalisar(resp.corpo);
+        const char *estadoRemoto = jsonObterTexto(jsonResp, "status");
 
-        if (st && strcmp(st, "COMITADO") == 0) {
-            printf("[RECUPERACAO] tx=%s: %s informa COMITADO -> confirmando aqui\n", id, r->anterior);
-            if (reservaDecidir(id, "COMITADO", NULL, 0) == ARMAZENAMENTO_OK) propagar("commit", r->proximo, id);
+        if (estadoRemoto && strcmp(estadoRemoto, "COMITADO") == 0) {
+            printf("[RECUPERACAO] tx=%s: %s informa COMITADO -> confirmando aqui\n", idTransacao, reserva->anterior);
+            if (reservaDecidir(idTransacao, "COMITADO", NULL, 0) == ARMAZENAMENTO_OK) propagarComando("commit", reserva->proximo, idTransacao);
         }
-        jsonLiberar(j);
+        jsonLiberar(jsonResp);
     }
     respostaLiberar(&resp);
 }
 
+/*
+ * Corpo da thread de recuperação. A cada INTERVALO_RECUPERACAO_S segundos:
+ *   1. resolve as reservas PREPARADO pendentes (idade >= TIMEOUT_PREPARADO_S);
+ *   2. conclui os cancelamentos que este servidor coordena e ficaram em CANCELANDO.
+ * Dorme em fatias de 0,1 s para encerrar rápido em txRecuperacaoParar.
+ */
 static void *cicloRecuperacao(void *arg) {
     (void) arg;
 
-    while (recuperando) {
-        for (int i = 0; i < INTERVALO_RECUPERACAO_S * 10 && recuperando; i++) usleep(100000);
-        if (!recuperando) break;
+    while (sistemaRecuperando) {
+        for (int i = 0; i < INTERVALO_RECUPERACAO_S * 10 && sistemaRecuperando; i++) usleep(100000);
+        if (!sistemaRecuperando) break;
 
-        Reserva *lista = NULL; int n = 0;
-        if (reservaPendentes(TIMEOUT_PREPARADO_S, &lista, &n) == ARMAZENAMENTO_OK) {
-            for (int i = 0; i < n && recuperando; i++) resolver(&lista[i]);
-            free(lista);
+        Reserva *listaReservas = NULL; 
+        int qtdReservas = 0;
+        
+        if (reservaPendentes(TIMEOUT_PREPARADO_S, &listaReservas, &qtdReservas) == ARMAZENAMENTO_OK) {
+            for (int i = 0; i < qtdReservas && sistemaRecuperando; i++) {
+                resolverTransacaoPendente(&listaReservas[i]);
+            }
+            free(listaReservas);
         }
 
-        lista = NULL; n = 0;
-        if (reservaListarPorEstado("CANCELANDO", &lista, &n) == ARMAZENAMENTO_OK) {
-            for (int i = 0; i < n && recuperando; i++) {
-                if (strcmp(lista[i].coordenadorId, servidor.id) != 0) continue;
-                if (cancelarCadeia(&lista[i]) == 0) {
-                    printf("[RECUPERACAO] tx=%s: cancelamento concluido\n", lista[i].idTransacao);
+        listaReservas = NULL; 
+        qtdReservas = 0;
+        
+        if (reservaListarPorEstado("CANCELANDO", &listaReservas, &qtdReservas) == ARMAZENAMENTO_OK) {
+            for (int i = 0; i < qtdReservas && sistemaRecuperando; i++) {
+                if (strcmp(listaReservas[i].coordenadorId, servidor.id) != 0) continue;
+                if (cancelarCadeia(&listaReservas[i]) == 0) {
+                    printf("[RECUPERACAO] tx=%s: cancelamento concluido\n", listaReservas[i].idTransacao);
                 }
             }
-            free(lista);
+            free(listaReservas);
         }
     }
     return NULL;
 }
 
+/*
+ * Inicia a thread de recuperação de falhas. Chamar depois de armazenamentoIniciar.
+ */
 void txRecuperacaoIniciar(void) {
-    recuperando = 1;
-    pthread_create(&thRecuperacao, NULL, cicloRecuperacao, NULL);
+    sistemaRecuperando = 1;
+    pthread_create(&threadRecuperacao, NULL, cicloRecuperacao, NULL);
 }
 
+/*
+ * Para a thread de recuperação e espera ela terminar. Não faz nada se não estava rodando.
+ */
 void txRecuperacaoParar(void) {
-    if (!recuperando) return;
-    recuperando = 0;
-    pthread_join(thRecuperacao, NULL);
+    if (!sistemaRecuperando) return;
+    sistemaRecuperando = 0;
+    pthread_join(threadRecuperacao, NULL);
 }

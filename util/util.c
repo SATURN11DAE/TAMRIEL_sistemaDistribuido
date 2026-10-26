@@ -1,3 +1,10 @@
+/* 
+ * util.c - Funções de apoio usadas pelo projeto todo
+ *   - Gerar UUIDs
+ *   - Buffer de texto que cresce sozinho (para montar respostas JSON)
+ *   - Respostas HTTP padronizadas, validação de id e funções de tempo
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,178 +14,199 @@
 
 #include "headers/util.h"
 
-void jsonEscape(const char *entrada, char *saida, size_t tamanho) {
-    size_t j = 0;
-    for (size_t i = 0; entrada[i] && j + 7 < tamanho; i++) {
-        unsigned char xar = (unsigned char) entrada[i];
-
-        if (xar == '"' || xar == '\\') {
-            saida[j++] = '\\';
-            saida[j++] = (char) xar;
-        } else if (xar == '\n') {
-            saida[j++] = '\\';
-            saida[j++] = 'n';
-        } else if (xar < 0x20) {
-            j += (size_t) snprintf(saida + j, tamanho - j, "\\u%04x", xar);
-        } else {
-            saida[j++] = (char) xar;
-        }
-    }
-    saida[j] = 0;
-}
-
-int jsonExtrairString(const char *json, const char *chave, char *saida, size_t tamanho) {
-    char padrao[96];
-    snprintf(padrao, sizeof padrao, "\"%s\"", chave);
-
-    const char *p = strstr(json, padrao);
-    if (!p) return 0;
-
-    p = strchr(p + strlen(padrao), ':');
-    if (!p) return 0;
-    p++;
-
-    while(*p == ' ' || *p == '\t' || *p == '\n') p++;
-    if (*p != '"') return 0;
-    p++;
-
-    size_t i = 0;
-    while (*p && *p != '"' && i < tamanho - 1) saida[i++] = *p++;
-    saida[i] = 0;
-
-    return 1;
-}
-
-int jsonExtrairInt(const char *json, const char *chave) {
-    char padrao[96];
-    snprintf(padrao, sizeof padrao, "\"%s\"", chave);
-
-    const char *p = strstr(json, padrao);
-    if (!p) return 0;
-
-    p = strchr(p + strlen(padrao), ':');
-    if (!p) return 0;
-    p++;
-
-    while (*p == ' ' || *p == '\t' || *p == '\n') p++;
-    return atoi(p);
-}
-
+/*
+ * Gera um UUID versão 4 (ex.: 3f2b8c1e-9a4d-4e7b-8c21-5d6e7f8a9b0c).
+ *   - saida: buffer de 37 bytes (36 caracteres + '\0'), preenchido pela função
+ * Usa rand(), então o programa deve chamar srand() uma vez no início.
+ * Serve para identificar entidades, não para segredos.
+ */
 void gerarUUID(char saida[37]) {
-    unsigned char id[16];
+    unsigned char bytes[16];
 
     for (int i = 0; i < 16; i++) {
-        id[i] = (unsigned char) (rand() & 0xFF);
+        bytes[i] = (unsigned char) (rand() & 0xFF);
     }
-    id[6] = (id[6] & 0x0F) | 0x40;
-    id[8] = (id[8] & 0x3F) | 0x80;
+    
+    bytes[6] = (bytes[6] & 0x0F) | 0x40;
+    bytes[8] = (bytes[8] & 0x3F) | 0x80;
 
     snprintf(saida, 37,
             "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-            id[0], id[1], id[2], id[3], id[4], id[5], id[6], id[7],
-            id[8], id[9], id[10], id[11], id[12], id[13], id[14], id[15]);
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]);
 }
 
-void bufIni(Buf *b) { b->p = NULL; b->n = 0; b->cap = 0; }
+/*  BUFFER DE TEXTO  */
 
-void bufLiberar(Buf *b) { free(b->p); bufIni(b); }
+/*
+ * Deixa o buffer vazio e pronto para uso (nenhuma memória alocada ainda).
+ */
+void bufferIniciar(Buffer *buffer) {
+    buffer->p = NULL;
+    buffer->n = 0;
+    buffer->cap = 0;
+}
 
-static int bufReservar(Buf *b, size_t extra) {
-    if (b->p && b->n + extra + 1 <= b->cap) return 1;
+/*
+ * Libera a memória do buffer e o deixa vazio de novo. Aceita buffer já vazio.
+ */
+void bufferLiberar(Buffer *buffer) {
+    free(buffer->p);
+    bufferIniciar(buffer);
+}
 
-    size_t nova = b->cap ? b->cap : 256;
-    while (nova < b->n + extra + 1) nova *= 2;
+/*
+ * Garante espaço para mais 'extra' caracteres (+1 do '\0'), dobrando a
+ * capacidade a cada vez (começa em 256 bytes).
+ * Retorna 1 se deu certo, 0 se faltou memória (o conteúdo antigo é preservado).
+ */
+static int bufferReservar(Buffer *buffer, size_t extra) {
+    if (buffer->p && buffer->n + extra + 1 <= buffer->cap) return 1;
 
-    char *novo = realloc(b->p, nova);
-    if (!novo) return 0;
+    size_t novaCapacidade = buffer->cap ? buffer->cap : 256;
+    while (novaCapacidade < buffer->n + extra + 1) novaCapacidade *= 2;
 
-    if (!b->p) novo[0] = 0;
-    b->p = novo;
-    b->cap = nova;
+    char *novaMemoria = realloc(buffer->p, novaCapacidade);
+    if (!novaMemoria) return 0;
+
+    if (!buffer->p) novaMemoria[0] = '\0';
+    buffer->p = novaMemoria;
+    buffer->cap = novaCapacidade;
     return 1;
 }
 
-int bufAdd(Buf *b, const char *fmt, ...) {
-    va_list ap, copia;
-    va_start(ap, fmt);
-    va_copy(copia, ap);
+/*
+ * Adiciona texto formatado ao final, igual ao printf.
+ * Mede o tamanho com um vsnprintf(NULL, 0, ...), reserva e só então escreve.
+ * Retorna 1 se deu certo, 0 se o formato for inválido ou faltou memória.
+ */
+int bufferAdicionar(Buffer *buffer, const char *formato, ...) {
+    va_list args, copiaArgs;
+    va_start(args, formato);
+    va_copy(copiaArgs, args);
 
-    int len = vsnprintf(NULL, 0, fmt, ap);
-    va_end(ap);
+    int tamanhoNecessario = vsnprintf(NULL, 0, formato, args);
+    va_end(args);
 
-    if (len < 0 || !bufReservar(b, (size_t) len)) { va_end(copia); return 0; }
+    if (tamanhoNecessario < 0 || !bufferReservar(buffer, (size_t) tamanhoNecessario)) { 
+        va_end(copiaArgs); 
+        return 0; 
+    }
 
-    vsnprintf(b->p + b->n, (size_t) len + 1, fmt, copia);
-    va_end(copia);
+    vsnprintf(buffer->p + buffer->n, (size_t) tamanhoNecessario + 1, formato, copiaArgs);
+    va_end(copiaArgs);
 
-    b->n += (size_t) len;
+    buffer->n += (size_t) tamanhoNecessario;
     return 1;
 }
 
-int bufChar(Buf *b, char c) {
-    if (!bufReservar(b, 1)) return 0;
-    b->p[b->n++] = c;
-    b->p[b->n] = 0;
+/*
+ * Adiciona um único caractere ao final e mantém o '\0' no fim.
+ * Retorna 1 se deu certo, 0 se faltou memória.
+ */
+int bufferAdicionarCaractere(Buffer *buffer, char caractere) {
+    if (!bufferReservar(buffer, 1)) return 0;
+    buffer->p[buffer->n++] = caractere;
+    buffer->p[buffer->n] = '\0';
     return 1;
 }
 
-int bufStr(Buf *b, const char *s) {
-    if (!s) s = "";
-    if (!bufChar(b, '"')) return 0;
+/*
+ * Adiciona 'texto' como string JSON: entre aspas, com " \ \n \r \t escapados
+ * e demais caracteres de controle (< 0x20) como \uXXXX.
+ *   - texto: NULL é tratado como ""
+ * Bytes acima de 0x7F (UTF-8) passam direto, sem escape.
+ * Retorna 1 se deu certo, 0 se faltou memória.
+ */
+int bufferAdicionarStringJSON(Buffer *buffer, const char *texto) {
+    if (!texto) texto = "";
+    if (!bufferAdicionarCaractere(buffer, '"')) return 0;
 
-    for (const unsigned char *q = (const unsigned char *) s; *q; q++) {
-        switch (*q) {
-            case '"':  bufAdd(b, "\\\""); break;
-            case '\\': bufAdd(b, "\\\\"); break;
-            case '\n': bufAdd(b, "\\n");  break;
-            case '\r': bufAdd(b, "\\r");  break;
-            case '\t': bufAdd(b, "\\t");  break;
+    for (const unsigned char *c = (const unsigned char *) texto; *c; c++) {
+        switch (*c) {
+            case '"':  bufferAdicionar(buffer, "\\\""); break;
+            case '\\': bufferAdicionar(buffer, "\\\\"); break;
+            case '\n': bufferAdicionar(buffer, "\\n");  break;
+            case '\r': bufferAdicionar(buffer, "\\r");  break;
+            case '\t': bufferAdicionar(buffer, "\\t");  break;
             default:
-                if (*q < 0x20) bufAdd(b, "\\u%04x", *q);
-                else bufChar(b, (char) *q);
+                if (*c < 0x20) bufferAdicionar(buffer, "\\u%04x", *c);
+                else bufferAdicionarCaractere(buffer, (char) *c);
         }
     }
-    return bufChar(b, '"');
+    return bufferAdicionarCaractere(buffer, '"');
 }
 
-char *bufTomar(Buf *b) {
-    if (!b->p) {
+/*
+ * Entrega o texto montado e esvazia o buffer.
+ * Quem chamar passa a ser dono do texto e deve dar free() nele.
+ * Se nada foi escrito, devolve uma string vazia alocada (ou NULL sem memória).
+ */
+char *bufferExtrairTexto(Buffer *buffer) {
+    if (!buffer->p) {
         char *vazio = malloc(1);
-        if (vazio) vazio[0] = 0;
+        if (vazio) vazio[0] = '\0';
         return vazio;
     }
-    char *p = b->p;
-    bufIni(b);
-    return p;
+    char *textoFinal = buffer->p;
+    bufferIniciar(buffer);
+    return textoFinal;
 }
 
-Resp respJSON(unsigned int http, char *json) {
-    Resp r = { http, json };
-    return r;
+/*  RESPOSTAS HTTP  */
+
+/*
+ * Monta uma resposta com código HTTP e JSON já prontos.
+ *   - json: texto alocado; a posse passa para a resposta (quem envia dá free)
+ */
+RespostaServidor criarRespostaJSON(unsigned int http, char *json) {
+    RespostaServidor resposta = { http, json };
+    return resposta;
 }
 
-Resp respErro(unsigned int http, const char *msg) {
-    Buf b;
-    bufIni(&b);
-    bufAdd(&b, "{\"erro\": ");
-    bufStr(&b, msg);
-    bufAdd(&b, "}\n");
-    return respJSON(http, bufTomar(&b));
+/*
+ * Monta uma resposta de erro no formato {"erro": "mensagem"}.
+ *   - mensagem: texto livre, escapado automaticamente para JSON
+ */
+RespostaServidor criarRespostaErro(unsigned int http, const char *mensagem) {
+    Buffer buffer;
+    bufferIniciar(&buffer);
+    bufferAdicionar(&buffer, "{\"erro\": ");
+    bufferAdicionarStringJSON(&buffer, mensagem);
+    bufferAdicionar(&buffer, "}\n");
+    return criarRespostaJSON(http, bufferExtrairTexto(&buffer));
 }
 
-int idValido(const char *s) {
-    if (!s || !*s || s[0] == '.' || strlen(s) > 100) return 0;
-    for (; *s; s++) {
-        unsigned char c = (unsigned char) *s;
+/* VALIDAÇÃO E TEMPO */
+
+/*
+ * Valida um id usado em URLs e nomes de arquivo (evita path traversal).
+ * Retorna 1 se o id é não vazio, tem até 100 caracteres, não começa com '.'
+ * e só contém letras, números, '-', '_' ou '.'. Caso contrário, 0.
+ */
+int identificadorValido(const char *id) {
+    if (!id || !*id || id[0] == '.' || strlen(id) > 100) return 0;
+    for (; *id; id++) {
+        unsigned char c = (unsigned char) *id;
         if (!(isalnum(c) || c == '-' || c == '_' || c == '.')) return 0;
     }
     return 1;
 }
 
-long agoraSegundos(void) { return (long) time(NULL); }
+/*
+ * Hora atual em segundos desde a época Unix (relógio de parede).
+ * Pode pular se o relógio do sistema for ajustado.
+ */
+long agoraEmSegundos(void) { 
+    return (long) time(NULL); 
+}
 
+/*
+ * Tempo em milissegundos que nunca volta para trás (CLOCK_MONOTONIC).
+ * Só serve para medir intervalos, o valor absoluto não tem significado.
+ */
 long agoraMonotonicoMs(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long) ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+    struct timespec instante;
+    clock_gettime(CLOCK_MONOTONIC, &instante);
+    return (long) instante.tv_sec * 1000L + instante.tv_nsec / 1000000L;
 }

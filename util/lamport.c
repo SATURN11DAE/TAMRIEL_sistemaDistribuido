@@ -1,31 +1,51 @@
+/*
+ * Implementação do relógio lógico de Lamport
+ */
+
 #include <pthread.h>
 
 #include "headers/lamport.h"
 
-static int lamport = 0;
-static pthread_mutex_t trava = PTHREAD_MUTEX_INITIALIZER;
+/* O valor do relógio deste servidor */
+static int valorRelogio = 0;
 
-int lamportTique(void) {
-    pthread_mutex_lock(&trava);
-    int relogio = ++lamport;
-    pthread_mutex_unlock(&trava);
+/* Protege o relógio, já que várias threads (uma por conexão) mexem nele */
+static pthread_mutex_t travaRelogio = PTHREAD_MUTEX_INITIALIZER;
 
-    return relogio;
+/*
+ * Evento local: soma 1 ao relógio e devolve o novo valor.
+ * Thread-safe (usa travaRelogio).
+ */
+int lamportIncrementar(void) {
+    pthread_mutex_lock(&travaRelogio);
+    int novoValor = ++valorRelogio;
+    pthread_mutex_unlock(&travaRelogio);
+
+    return novoValor;
 }
 
-int lamportAtualizar(int atual) {
-    pthread_mutex_lock(&trava);
-    lamport = (atual > lamport ? atual : lamport) + 1;
-    int relogio = lamport;
-    pthread_mutex_unlock(&trava);
+/*
+ * Ao receber uma mensagem: relógio = max(meu, recebido) + 1.
+ *   - relogioRecebido: valor do cabeçalho X-Lamport-Clock da mensagem
+ * Retorna o novo valor do relógio. Thread-safe.
+ */
+int lamportSincronizar(int relogioRecebido) {
+    pthread_mutex_lock(&travaRelogio);
+    /* Pega o maior dos dois relógios e soma 1 */
+    valorRelogio = (relogioRecebido > valorRelogio ? relogioRecebido : valorRelogio) + 1;
+    int novoValor = valorRelogio;
+    pthread_mutex_unlock(&travaRelogio);
 
-    return relogio;
+    return novoValor;
 }
 
-int lamportMostrar(void) {
-    pthread_mutex_lock(&trava);
-    int relogio = lamport;
-    pthread_mutex_unlock(&trava);
+/*
+ * Lê o valor atual sem alterá-lo. Thread-safe.
+ */
+int lamportObterValor(void) {
+    pthread_mutex_lock(&travaRelogio);
+    int valorAtual = valorRelogio;
+    pthread_mutex_unlock(&travaRelogio);
 
-    return relogio;
+    return valorAtual;
 }
