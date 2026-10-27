@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Skyrim – The Ride Scrolls</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+  <!-- TELA DE LOGIN -->
+  <section id="login">
+    <div class="lbox">
+      <h1>SKYRIM</h1>
+      <h2>THE RIDE SCROLLS</h2>
+      <div id="lform"></div>   <!-- formulário montado por js/login.js -->
+      <div id="status"></div>  <!-- mensagem de erro/sucesso do login -->
+    </div>
+  </section>
+
+  <!-- APLICAÇÃO (depois do login) -->
+  <section id="app" class="hide">
+
+    <!-- Painel lateral -->
+    <aside id="side">
+      <h1><span id="titulo"></span><a id="sair">sair</a></h1>
+      <div class="tabs" id="tabs"></div>          <!-- abas (js/painel.js) -->
+      <div class="scroll" id="conteudo"></div>    <!-- conteúdo da aba atual -->
+      <div id="msg"></div>                        <!-- mensagens de feedback -->
+    </aside>
+
+    <!-- Mapa -->
+    <div id="mapwrap">
+      <svg id="map" xmlns="http://www.w3.org/2000/svg"></svg>
+      <div id="tip" class="hide"></div>           <!-- tooltip ao passar o mouse -->
+
+      <div class="tgl">
+        <button class="btn sm" id="tg" aria-label="Esconder painel" title="Esconder/mostrar painel"><span>☰</span></button>
+      </div>
+
+      <div class="cost">
+        <button class="btn sm" id="zi" aria-label="Aproximar"><span>+</span></button>
+        <button class="btn sm" id="zo" aria-label="Afastar"><span>−</span></button>
+      </div>
+
+      <div class="leg">
+        <i style="background:#7be07b"></i>origem
+        <i style="background:#ff7878;margin-left:10px"></i>destino<br>
+        Clique em dois locais do mapa. Arraste para mover, role para dar zoom.
+      </div>
+    </div>
+  </section>
+
+  <!-- Ordem importa: cada arquivo usa o que foi definido nos anteriores -->
+  <script src="js/dados.js"></script>   <!-- locais e tipos do mapa -->
+  <script src="js/api.js"></script>     <!-- "servidor" simulado -->
+  <script src="js/estado.js"></script>  <!-- estado global + helpers de UI -->
+  <script src="js/login.js"></script>   <!-- tela de login/cadastro -->
+  <script src="js/painel.js"></script>  <!-- painel lateral (abas) -->
+  <script src="js/mapa.js"></script>    <!-- mapa SVG (pan/zoom/cliques) -->
+  <script src="js/main.js"></script>    <!-- inicialização -->
+</body>
+</html>

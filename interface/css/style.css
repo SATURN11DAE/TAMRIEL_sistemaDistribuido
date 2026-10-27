@@ -1,0 +1,307 @@
+/* =====================================================
+   SKYRIM – THE RIDE SCROLLS
+   Índice:
+   1. Variáveis e base
+   2. Botões e campos (estilo Skyrim)
+   3. Tela de login
+   4. Layout do app e painel lateral
+   5. Cartões e cores de status
+   6. Mapa e controles
+   7. Responsivo / acessibilidade
+   ===================================================== */
+
+/* ---------- 1. Variáveis e base ---------- */
+:root {
+  --bg: #07090b;
+  --panel: rgba(10, 12, 15, .92);
+  --line: #8a8d91;
+  --hi: #fff;
+  --txt: #d3d5d8;
+  --mut: #8a8d91;
+  --ok: #7be07b;
+  --bad: #ff7878;
+  --warn: #ffb347;
+  --yel: #f2e46b;
+  color-scheme: dark;
+}
+
+html {
+  height: 100%;
+  box-sizing: border-box;
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+  scroll-padding-top: env(safe-area-inset-top, 0px);
+}
+
+*, *::before, *::after { box-sizing: inherit; }
+
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--txt);
+  font-family: "Futura Condensed", "Futura", "Oswald", "Arial Narrow", sans-serif;
+  letter-spacing: .04em;
+  overflow: hidden;
+}
+
+button, input { font: inherit; letter-spacing: inherit; color: inherit; }
+
+.hide { display: none !important; }
+
+
+/* ---------- 2. Botões e campos (formato angular) ---------- */
+.btn {
+  --c: var(--line);               /* cor da borda */
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 38px;
+  margin: 0 0 10px;
+  padding: 0;
+  border: 0;
+  background: var(--c);
+  cursor: pointer;
+  font-size: 19px;
+  clip-path: polygon(19px 0, calc(100% - 19px) 0, 100% 50%, calc(100% - 19px) 100%, 19px 100%, 0 50%);
+}
+
+/* "miolo" escuro do botão (a borda aparece pela diferença de 2px) */
+.btn::before {
+  content: "";
+  position: absolute;
+  inset: 2px;
+  background: #0b0d10;
+  clip-path: polygon(18px 0, calc(100% - 18px) 0, 100% 50%, calc(100% - 18px) 100%, 18px 100%, 0 50%);
+  transition: background .15s;
+}
+
+.btn > span { position: relative; color: var(--txt); }
+
+.btn:hover, .btn.on, .btn:focus-visible { --c: var(--hi); outline: 0; }
+.btn:hover::before, .btn:focus-visible::before { background: #1a1d21; }
+.btn:hover > span, .btn.on > span { color: var(--hi); }
+
+.btn.sm { height: 30px; font-size: 16px; margin: 0; }
+
+/* Campo de texto com o mesmo formato do botão */
+.fld { cursor: text; justify-content: flex-start; }
+
+.fld label {
+  position: relative;
+  flex: none;
+  width: 118px;
+  padding-left: 26px;
+  color: var(--mut);
+  font-size: 17px;
+  white-space: nowrap;
+}
+
+.fld input {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  padding: 0 22px 0 0;
+  background: none;
+  border: 0;
+  outline: 0;
+  color: var(--hi);
+  font-size: 19px;
+}
+
+.fld:focus-within { --c: var(--hi); }
+
+
+/* ---------- 3. Tela de login ---------- */
+#login {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  overflow: auto;
+  background:
+    linear-gradient(rgba(5, 7, 10, .4), rgba(5, 7, 10, .7)),
+    url(../img/login-bg.jpg) center / cover no-repeat #07090b;
+}
+
+.lbox { width: min(360px, 92vw); padding: 24px 0; }
+
+.lbox h1 {
+  margin: 0;
+  text-align: center;
+  font-weight: 400;
+  font-size: 60px;
+  letter-spacing: .3em;
+  color: #fff;
+}
+
+.lbox h2 {
+  margin: 0 0 34px;
+  text-align: center;
+  font-weight: 400;
+  font-size: 18px;
+  letter-spacing: .5em;
+  color: #fff;
+}
+
+#status {
+  min-height: 24px;
+  margin-top: 14px;
+  text-align: center;
+  color: var(--yel);
+  font-size: 18px;
+}
+
+
+/* ---------- 4. Layout do app e painel lateral ---------- */
+#app {
+  position: fixed;
+  inset: env(safe-area-inset-top, 0px) 0 env(safe-area-inset-bottom, 0px) 0;
+  display: grid;
+  grid-template-columns: 380px 1fr;   /* painel | mapa */
+}
+
+#side {
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  padding: 20px 15px 14px;
+  background: var(--panel);
+  border-right: 1px solid #22262b;
+}
+
+#side h1 {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin: 0 0 4px;
+  font-weight: 400;
+  font-size: 28px;
+  color: #fff;
+}
+
+#side h1 a {
+  font-size: 14px;
+  color: var(--mut);
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.tabs { display: flex; gap: 8px; margin: 12px 0 16px; }
+
+.scroll {
+  flex: 1;
+  min-height: 0;
+  padding: 2px 2px 6px;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+.mini { margin: 0 0 4px; color: var(--mut); font-size: 16px; }
+
+.sel { margin: 0 0 6px; font-size: 18px; color: #fff; }
+.sel b { display: inline-block; width: 82px; color: var(--mut); font-weight: 400; }
+
+#msg { min-height: 22px; padding-top: 6px; color: var(--yel); font-size: 16px; }
+
+/* Painel escondido (botão ☰) */
+#app.oculto { grid-template-columns: 1fr; }
+#app.oculto #side { display: none; }
+
+
+/* ---------- 5. Cartões e cores de status ---------- */
+.card {
+  margin-bottom: 8px;
+  padding: 8px 10px;
+  background: rgba(0, 0, 0, .6);
+  border: 1px solid rgba(255, 255, 255, .12);
+  font-size: 15px;
+}
+.card.a { border-color: rgba(123, 224, 123, .4); }   /* ativo */
+.card.c { border-color: rgba(255, 120, 120, .4); }   /* cancelado */
+
+.card .h { display: flex; justify-content: space-between; color: #fff; font-size: 16px; }
+.card .r { margin-top: 3px; color: #b9bcc0; }
+
+.card.pick { border-color: #fff; background: rgba(255, 255, 255, .08); cursor: pointer; }
+.card.pick.on { background: rgba(255, 255, 255, .15); }
+
+.ok   { color: var(--ok); }
+.bad  { color: var(--bad); }
+.warn { color: var(--warn); }
+
+.trecho-pendente { margin-bottom: 3px; font-size: 15px; }
+
+
+/* ---------- 6. Mapa e controles ---------- */
+#mapwrap {
+  position: relative;
+  min-width: 0;
+  background: #10151a;
+  overflow: hidden;
+  touch-action: none;
+}
+
+#map { display: block; width: 100%; height: 100%; cursor: grab; user-select: none; }
+#map:active { cursor: grabbing; }
+
+/* Rótulos dos locais: só aparecem conforme o zoom (classes z1/z2 no <svg>) */
+.lbl {
+  display: none;
+  fill: #e6e6e6;
+  paint-order: stroke;
+  stroke: #000;
+  stroke-width: 3.5px;
+  text-anchor: middle;
+  font-size: 14px;
+  font-family: "Futura Condensed", "Oswald", "Arial Narrow", sans-serif;
+  pointer-events: none;
+}
+svg.z1 .l0, svg.z2 .l1 { display: block; }
+
+#tip {
+  position: absolute;
+  padding: 3px 10px;
+  background: rgba(0, 0, 0, .85);
+  border: 1px solid #fff;
+  color: #fff;
+  font-size: 16px;
+  white-space: nowrap;
+  transform: translate(12px, -34px);
+  pointer-events: none;
+}
+
+.leg {
+  position: absolute;
+  left: 12px;
+  bottom: 12px;
+  padding: 8px 12px;
+  background: rgba(0, 0, 0, .7);
+  color: var(--txt);
+  font-size: 14px;
+  line-height: 1.7;
+}
+.leg i { display: inline-block; width: 10px; height: 10px; margin-right: 6px; border-radius: 50%; }
+
+.cost { position: absolute; right: 12px; top: 12px; display: flex; flex-direction: column; gap: 6px; }
+.cost .btn { width: 44px; margin: 0; }
+
+.tgl { position: absolute; left: 12px; top: 12px; z-index: 3; }
+.tgl .btn { width: 44px; margin: 0; }
+
+
+/* ---------- 7. Responsivo / acessibilidade ---------- */
+@media (max-width: 820px) {
+  #app { grid-template-columns: 1fr; grid-template-rows: 42vh 1fr; }   /* mapa em cima, painel embaixo */
+  #app.oculto { grid-template-rows: 1fr; }
+  #mapwrap { order: -1; }
+  #side { border-right: 0; border-top: 1px solid #22262b; }
+  .leg { display: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; }
+}
