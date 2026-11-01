@@ -494,12 +494,14 @@ static int encontrarIndiceReserva(const char *id) {
 }
 
 /*
- * Conta quantos trechos de reservas (de qualquer faixa e estado) usam esta carona.
- * Se for maior que zero, a carona não pode ser removida. Chamar com a trava.
+ * Conta quantos trechos de reservas usam esta carona. Se for maior que zero,
+ * a carona não pode ser removida. Reservas CANCELADA_MOTORISTA não contam: já
+ * não ocupam assento e só esperam o passageiro dispensar o aviso. Chamar com a trava.
  */
 static int contarAssentosOcupadosNaCarona(const char *idCarona) {
     int total = 0;
     for (int i = 0; i < quantidadeReservas; i++) {
+        if (strcmp(reservas[i].estado, ESTADO_CANCELADA_MOTORISTA) == 0) continue;
         for (int k = 0; k < reservas[i].qtdLocais; k++) {
             if (strcmp(reservas[i].locais[k].idCarona, idCarona) == 0) total++;
         }
@@ -540,6 +542,7 @@ static int reservaEaMaisAntiga(const Reserva *a, const Reserva *b) {
  * (numero <= menor capacidade da faixa).
  * Reservas que nao se sobrepoem a faixa nao ocupam nada: o mesmo assento pode
  * ser vendido para quem viaja antes/depois.
+ * Reservas CANCELADA_MOTORISTA nao ocupam nada em nenhuma faixa.
  */
 typedef struct {
     int livres;        /* quantidade de assentos livres na faixa */
@@ -567,6 +570,8 @@ static Intervalo analisarIntervalo(const Carona *c, int de, int ate, const Reser
     memset(usados, 0, sizeof usados);
 
     for (int i = 0; i < quantidadeReservas; i++) {
+        if (strcmp(reservas[i].estado, ESTADO_CANCELADA_MOTORISTA) == 0) continue;
+
         for (int k = 0; k < reservas[i].qtdLocais; k++) {
             const TrechoRes *o = &reservas[i].locais[k];
             if (strcmp(o->idCarona, c->id) != 0) continue;
@@ -938,9 +943,11 @@ char *caronasListarJSON(void) {
 /*
  * Remove uma carona (da memória e do disco).
  *   - motorista: se != NULL, só remove se a carona for dele
+ * Reservas CANCELADA_MOTORISTA não impedem a remoção (ver
+ * contarAssentosOcupadosNaCarona).
  * Retorna ARMAZENAMENTO_OK, ARMAZENAMENTO_NAO_ENCONTRADO,
  * ARMAZENAMENTO_PROIBIDO se pertence a outro motorista ou
- * ARMAZENAMENTO_CONFLITO se a carona já tem reservas.
+ * ARMAZENAMENTO_CONFLITO se a carona ainda tem reservas ativas.
  */
 int caronaRemover(const char *id, const char *motorista) {
     pthread_mutex_lock(&trava);
@@ -1082,9 +1089,13 @@ int reservaBuscar(const char *id, Reserva *saida) {
 
 /*
  * Muda o estado da reserva e grava em disco. Acorda quem espera em reservaPreparar.
- *   - estado: ESTADO_PREPARADO, ESTADO_COMITADO ou ESTADO_CANCELANDO
+ *   - estado: ESTADO_PREPARADO, ESTADO_COMITADO, ESTADO_CANCELANDO ou
+ *     ESTADO_CANCELADA_MOTORISTA
  *   - itin: se != NULL, guarda também o itinerário completo (até MAX_TRECHOS_TX)
- * Retorna ARMAZENAMENTO_OK, ARMAZENAMENTO_NAO_ENCONTRADO ou ARMAZENAMENTO_ERRO.
+ * Uma reserva CANCELADA_MOTORISTA não pode voltar a COMITADO (um commit atrasado
+ * não a ressuscita): devolve ARMAZENAMENTO_CONFLITO.
+ * Retorna ARMAZENAMENTO_OK, ARMAZENAMENTO_NAO_ENCONTRADO, ARMAZENAMENTO_CONFLITO
+ * ou ARMAZENAMENTO_ERRO.
  */
 int reservaDecidir(const char *id, const char *estado, const TrechoRes *itin, int qtdItin) {
     pthread_mutex_lock(&trava);
@@ -1094,6 +1105,9 @@ int reservaDecidir(const char *id, const char *estado, const TrechoRes *itin, in
     
     if (indice < 0) {
         rc = ARMAZENAMENTO_NAO_ENCONTRADO;
+    } else if (strcmp(reservas[indice].estado, ESTADO_CANCELADA_MOTORISTA) == 0 &&
+               strcmp(estado, ESTADO_COMITADO) == 0) {
+        rc = ARMAZENAMENTO_CONFLITO;
     } else {
         copiarStringSegura(reservas[indice].estado, sizeof reservas[indice].estado, estado);
         
@@ -1179,6 +1193,40 @@ int reservaListarPorEstado(const char *estado, Reserva **lista, int *qtd) {
     int n = 0;
     for (int i = 0; i < quantidadeReservas; i++) {
         if (strcmp(reservas[i].estado, estado) == 0) vetor[n++] = reservas[i];
+    }
+
+    pthread_mutex_unlock(&trava);
+    *lista = vetor; 
+    *qtd = n;
+    
+    return ARMAZENAMENTO_OK;
+}
+
+/*
+ * Lista cópias das reservas (PREPARADO, COMITADO ou já CANCELADA_MOTORISTA) que
+ * usam a carona. As CANCELANDO ficam de fora: o passageiro já está cancelando.
+ *   - lista / qtd: recebem o vetor alocado e a quantidade (quem chama dá free na lista)
+ * Retorna ARMAZENAMENTO_OK ou ARMAZENAMENTO_ERRO se faltou memória.
+ */
+int reservaListarPorCarona(const char *idCarona, Reserva **lista, int *qtd) {
+    pthread_mutex_lock(&trava);
+
+    Reserva *vetor = malloc((size_t) (quantidadeReservas ? quantidadeReservas : 1) * sizeof *vetor);
+    if (!vetor) { 
+        pthread_mutex_unlock(&trava); 
+        return ARMAZENAMENTO_ERRO; 
+    }
+
+    int n = 0;
+    for (int i = 0; i < quantidadeReservas; i++) {
+        if (strcmp(reservas[i].estado, ESTADO_CANCELANDO) == 0) continue;
+
+        for (int k = 0; k < reservas[i].qtdLocais; k++) {
+            if (strcmp(reservas[i].locais[k].idCarona, idCarona) == 0) {
+                vetor[n++] = reservas[i];
+                break;
+            }
+        }
     }
 
     pthread_mutex_unlock(&trava);

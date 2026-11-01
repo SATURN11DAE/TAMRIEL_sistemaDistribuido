@@ -1,12 +1,19 @@
 /* =====================================================
    TELA DE LOGIN / CADASTRO
+   Cada passageiro/motorista conecta no servidor da SUA empresa:
+   o campo SERVIDOR recebe a URL dele (ex.: http://localhost:3001).
+   O login usa o ID (letras, números, - _ .), não e-mail.
    ===================================================== */
+
+const SERVIDOR_PADRAO = "http://localhost:3001";
+let enviando = false;   // evita enviar duas vezes enquanto espera o servidor
 
 function renderLogin() {
   $("#lform").innerHTML =
     btn("TIPO: " + S.tipo, "b-tipo") +
-    (S.cadastro ? fld("NOME:", "l-nome") + fld("CONTATO:", "l-cont") : "") +
-    fld("EMAIL:", "l-email") +
+    fld("SERVIDOR:", "l-srv", S.srv || SERVIDOR_PADRAO) +
+    (S.cadastro ? fld("NOME:", "l-nome") : "") +
+    fld("ID:", "l-id") +
     fld("SENHA:", "l-senha", "", "password") +
     btn(S.cadastro ? "CADASTRAR" : "ENTRAR", "b-ok") +
     btn(S.cadastro ? "JÁ TENHO CONTA" : "NOVA CONTA", "b-troca");
@@ -14,7 +21,7 @@ function renderLogin() {
   // Alterna PASSAGEIRO <-> MOTORISTA sem perder o que já foi digitado
   $("#b-tipo").onclick = () => {
     S.tipo = S.tipo === "PASSAGEIRO" ? "MOTORISTA" : "PASSAGEIRO";
-    const ids = ["l-nome", "l-cont", "l-email"];
+    const ids = ["l-srv", "l-nome", "l-id"];
     const digitado = ids.map(v);
     renderLogin();
     ids.forEach((id, i) => { if ($("#" + id)) $("#" + id).value = digitado[i]; });
@@ -22,6 +29,7 @@ function renderLogin() {
 
   // Alterna entre "entrar" e "criar conta"
   $("#b-troca").onclick = () => {
+    S.srv = v("l-srv");
     S.cadastro = !S.cadastro;
     $("#status").textContent = "";
     renderLogin();
@@ -32,11 +40,18 @@ function renderLogin() {
 }
 
 
-function enviarLogin() {
-  const r = S.cadastro
-    ? API.cadastro(S.tipo, v("l-nome"), v("l-cont"), v("l-email"), v("l-senha"))
-    : API.login(S.tipo, v("l-email"), v("l-senha"));
+async function enviarLogin() {
+  if (enviando) return;
+  enviando = true;
 
+  S.srv = v("l-srv");
+  $("#status").textContent = "Conectando...";
+
+  const r = S.cadastro
+    ? await API.cadastro(S.tipo, v("l-nome"), v("l-id"), v("l-senha"), S.srv)
+    : await API.login(S.tipo, v("l-id"), v("l-senha"), S.srv);
+
+  enviando = false;
   $("#status").textContent = r.mensagem;
   if (!r.ok) return;
 
@@ -63,6 +78,8 @@ function entrarNoApp(mensagem) {
   S.itens = [];
   S.sel = -1;
   S.pend = [];
+  S.selRes = "";
+  S.selCar = "";
 
   $("#login").classList.add("hide");
   $("#app").classList.remove("hide");
@@ -76,6 +93,7 @@ function entrarNoApp(mensagem) {
 
 /* Botão "sair" */
 $("#sair").onclick = () => {
+  API.sair();
   $("#app").classList.add("hide");
   $("#login").classList.remove("hide");
   S.tela = "login";

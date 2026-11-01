@@ -11,6 +11,7 @@
 #include "headers/persistencia.h"
 #include "headers/json.h"
 #include "headers/auth.h"
+#include "headers/transacao.h"
 #include "headers/cadastro.h"
 
 /*
@@ -228,20 +229,37 @@ RespostaServidor cadastroListarCaronasDe(const char *motorista) {
 
 /*
  * Exclui uma carona (DELETE /caronas/{id}).
- * Retorna 200 se excluída, 404 se não existe, 403 se é de outro motorista,
- * 409 se já tem reservas ou 400/500 em caso de erro.
+ * Se a carona tem reservas, elas são marcadas como CANCELADA_MOTORISTA e a
+ * cadeia do 2PC é avisada nos dois sentidos antes de a carona ser apagada.
+ * Retorna 200 se excluída, 202 se alguma empresa do trajeto não recebeu o aviso
+ * (a carona fica; repita a exclusão), 404 se não existe, 403 se é de outro
+ * motorista, 409 se uma reserva entrou durante a exclusão ou 400/500 em erro.
  */
 RespostaServidor cadastroRemoverCarona(const char *motorista, const char *idCarona) {
     if (!idCarona || !identificadorValido(idCarona)) return criarRespostaErro(400, "id da carona invalido");
 
-    int rc = caronaRemover(idCarona, motorista);
+    Carona c;
+    if (caronaBuscar(idCarona, &c) != ARMAZENAMENTO_OK) return criarRespostaErro(404, "Carona nao encontrada");
+    if (motorista && strcmp(c.motorista, motorista) != 0) return criarRespostaErro(403, "Esta carona pertence a outro motorista");
 
+    /* Cancela (e avisa a cadeia de) todas as reservas que usam a carona */
+    int falhas = txCancelarReservasDaCarona(idCarona);
+    if (falhas < 0) return criarRespostaErro(500, "Falha ao cancelar as reservas da carona");
+    if (falhas > 0) {
+        Buffer b; 
+        bufferIniciar(&b);
+        bufferAdicionar(&b, "{\"id\": ");
+        bufferAdicionarStringJSON(&b, idCarona);
+        bufferAdicionar(&b, ", \"status\": \"CANCELANDO_RESERVAS\", \"mensagem\": \"Alguma empresa do trajeto esta fora do ar. "
+                            "As reservas ja foram marcadas como canceladas; repita a exclusao quando ela voltar.\"}\n");
+        return criarRespostaJSON(202, bufferExtrairTexto(&b));
+    }
+
+    int rc = caronaRemover(idCarona, motorista);
     if (rc == ARMAZENAMENTO_NAO_ENCONTRADO) return criarRespostaErro(404, "Carona nao encontrada");
     if (rc == ARMAZENAMENTO_PROIBIDO)       return criarRespostaErro(403, "Esta carona pertence a outro motorista");
-    if (rc == ARMAZENAMENTO_CONFLITO) {
-        return criarRespostaErro(409, "A carona tem reservas ativas; so pode ser excluida depois que os passageiros cancelarem");
-    }
-    if (rc != ARMAZENAMENTO_OK) return criarRespostaErro(500, "Falha ao excluir a carona");
+    if (rc == ARMAZENAMENTO_CONFLITO)       return criarRespostaErro(409, "Ha uma reserva nova ou em cancelamento nesta carona; tente de novo em instantes");
+    if (rc != ARMAZENAMENTO_OK)             return criarRespostaErro(500, "Falha ao excluir a carona");
 
     Buffer buffer; 
     bufferIniciar(&buffer);

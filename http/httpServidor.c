@@ -150,6 +150,7 @@ static int casarRecurso(const char *sub, const char *prefixo, char *id, size_t n
  *   POST   /reservas/prepare           txPrepare
  *   PUT    /reservas/{id}/commit       txCommit
  *   PUT    /reservas/{id}/cancel       txCancel
+ *   PUT    /reservas/{id}/cancel-motorista  txCancelarMotorista
  *   GET    /reservas/{id}/status       txStatus
  *   DELETE /reservas/{id}              txRollback
  * Qualquer outra combinação devolve 404.
@@ -171,6 +172,7 @@ static enum MHD_Result rotasConsorcio(struct MHD_Connection *c, const char *sub,
     if (post && strcmp(sub, "/reservas/prepare") == 0) return enviar(c, txPrepare(ctx->corpo, remetente));
     if (put && casarReserva(sub, "/commit", id, sizeof id)) return enviar(c, txCommit(id));
     if (put && casarReserva(sub, "/cancel", id, sizeof id)) return enviar(c, txCancel(id));
+    if (put && casarReserva(sub, "/cancel-motorista", id, sizeof id)) return enviar(c, txCancelarMotorista(id, remetente));
     if (get && casarReserva(sub, "/status", id, sizeof id)) return enviar(c, txStatus(id));
     if (del && casarReserva(sub, "", id, sizeof id)) return enviar(c, txRollback(id));
 

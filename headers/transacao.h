@@ -16,6 +16,9 @@
 RespostaServidor txReservar(const char *corpo);
 RespostaServidor txReservarComo(const char *passageiro, const char *corpo);
 RespostaServidor txCancelar(const char *idTransacao, const char *passageiro);
+/* Chamada quando o motorista exclui a carona: cancela as reservas que a usam.
+ * Retorna quantas NÃO foram totalmente propagadas (0 = tudo certo), -1 em falha interna. */
+int txCancelarReservasDaCarona(const char *idCarona);
 
 /* FUNÇÕES DO PARTICIPANTE (Recebe comandos do coordenador ou de outro nó) */
 RespostaServidor txPrepare(const char *corpo, const char *remetente);
@@ -23,6 +26,7 @@ RespostaServidor txCommit(const char *idTransacao);
 RespostaServidor txRollback(const char *idTransacao);
 RespostaServidor txStatus(const char *idTransacao);
 RespostaServidor txCancel(const char *idTransacao);
+RespostaServidor txCancelarMotorista(const char *idTransacao, const char *remetente);
 
 /* THREAD DE RECUPERAÇÃO DE FALHAS */
 void txRecuperacaoIniciar(void);

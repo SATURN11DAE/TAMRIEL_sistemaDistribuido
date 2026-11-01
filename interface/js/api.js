@@ -1,169 +1,246 @@
 /* =====================================================
-   API – "servidor" simulado em memória
-   Todos os dados somem ao recarregar a página.
-   Para usar um backend de verdade, troque o corpo destes
-   métodos por fetch()/WebSocket mantendo o mesmo formato
-   de resposta: { ok, mensagem, ...extra }
+   API – cliente HTTP do servidor do consórcio (C + libmicrohttpd)
+
+   Cada função fala com /api/cliente/... do servidor da empresa
+   escolhida na tela de login. A interface NÃO decide nada:
+   atomicidade, assentos e 2PC são resolvidos no servidor.
+
+   Formato de resposta mantido: { ok, mensagem, ...extra }
+   Todas as funções são assíncronas (usar await).
    ===================================================== */
 const API = (() => {
 
-  /* ---------- Dados iniciais ---------- */
-  const usuarios = [
-    { tipo: "PASSAGEIRO", nome: "Demo",  contato: "-", email: "p@p.com", senha: "1" },
-    { tipo: "MOTORISTA",  nome: "Lydia", contato: "-", email: "m@m.com", senha: "1" }
-  ];
+  let base = "";        // ex.: http://localhost:3001
+  let auth = "";        // "Basic base64(id:senha)"
+  let usuario = null;   // { id, nome, tipo, servidor }
 
-  let caronas  = [];
-  let reservas = [];
-  let proxCarona  = 1;     // próximo id de carona
-  let proxReserva = 1;     // próximo id de reserva
-  let usuarioLogado = null;
-
-  /* Um trecho = um pedaço da viagem (origem → destino) com preço e vagas. */
-  const criarTrecho = (origem, destino, preco, vagas) =>
-    ({ origem, destino, preco, vagasTotal: vagas, vagasDisp: vagas, pax: 0 });
-
-  caronas.push({
-    id: proxCarona++, motorista: "m@m.com", data: "2026-11-01", horario: "08:00", ativa: true,
-    trechos: [criarTrecho("Whiterun", "Riverwood", 10, 3), criarTrecho("Riverwood", "Falkreath", 15, 3)]
-  });
-  caronas.push({
-    id: proxCarona++, motorista: "m@m.com", data: "2026-11-01", horario: "09:30", ativa: true,
-    trechos: [criarTrecho("Whiterun", "Windhelm", 30, 2), criarTrecho("Windhelm", "Riften", 25, 2)]
-  });
-
-  /* Formato padrão de resposta */
   const resposta = (ok, mensagem, extra = {}) => ({ ok, mensagem, ...extra });
 
 
-  /* ---------- Usuários ---------- */
-  function login(tipo, email, senha) {
-    const u = usuarios.find(u => u.email === email && u.senha === senha && u.tipo === tipo);
-    if (!u) return resposta(false, "Credenciais inválidas.");
-    usuarioLogado = u;
-    return resposta(true, "Bem-vindo, " + u.nome + "!", { u });
+  /* ---------- Utilidades ---------- */
+
+  const b64 = s => btoa(String.fromCharCode(...new TextEncoder().encode(s)));
+
+  const normalizarURL = u => {
+    u = (u || "").trim().replace(/\/+$/, "");
+    return u ? (/^https?:\/\//i.test(u) ? u : "http://" + u) : "";
+  };
+
+  /* O servidor não tem campo "data": ela vai dentro do horário ("2026-11-01 08:00"). */
+  const temData = h => /^\d{4}-\d{2}-\d{2}/.test(h || "");
+
+  /* Faz a requisição. Nunca lança exceção: devolve { rede, http, json, erro }. */
+  async function http(metodo, caminho, corpo, timeoutMs = 10000) {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), timeoutMs);
+
+    const headers = { Accept: "application/json" };
+    if (auth) headers.Authorization = auth;
+    if (corpo !== undefined) headers["Content-Type"] = "application/json";
+
+    try {
+      const r = await fetch(base + "/api/cliente" + caminho, {
+        method: metodo,
+        headers,
+        signal: ctl.signal,
+        body: corpo !== undefined ? JSON.stringify(corpo) : undefined
+      });
+      let json = {};
+      try { json = (await r.json()) || {}; } catch (_) {}
+      return { rede: true, http: r.status, json };
+    } catch (e) {
+      return {
+        rede: false, http: 0, json: {},
+        erro: e.name === "AbortError"
+          ? "O servidor demorou demais para responder."
+          : "Servidor inacessível em " + base + "."
+      };
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
-  function cadastro(tipo, nome, contato, email, senha) {
-    if (!nome || !email || !senha) return resposta(false, "Preencha todos os campos.");
-    if (usuarios.some(u => u.email === email)) return resposta(false, "E-mail já cadastrado.");
-    usuarios.push({ tipo, nome, contato, email, senha });
-    return resposta(true, "Cadastro feito. Faça login.");
+  const motivo = r =>
+    !r.rede ? r.erro : (r.json.motivo || r.json.erro || "Erro HTTP " + r.http + ".");
+
+  /* Guarda rota/preço da reserva no navegador (o servidor só guarda ids e assentos). */
+  const CHAVE_META = "ride-scrolls-reservas";
+  const lerMeta = () => { try { return JSON.parse(localStorage.getItem(CHAVE_META)) || {}; } catch (_) { return {}; } };
+  const gravarMeta = (id, m) => {
+    try { const x = lerMeta(); x[id] = m; localStorage.setItem(CHAVE_META, JSON.stringify(x)); } catch (_) {}
+  };
+
+
+  /* ---------- Usuários ---------- */
+
+  async function login(tipo, id, senha, url) {
+    base = normalizarURL(url);
+    if (!base) return resposta(false, "Informe o servidor.");
+    if (!id || !senha) return resposta(false, "Informe ID e senha.");
+
+    auth = "Basic " + b64(id + ":" + senha);
+    const r = await http("GET", "/eu");
+
+    if (!r.rede)          { auth = ""; return resposta(false, r.erro); }
+    if (r.http === 401)   { auth = ""; return resposta(false, "ID ou senha incorretos."); }
+    if (r.http !== 200)   { auth = ""; return resposta(false, motivo(r)); }
+
+    if (String(r.json.tipo).toUpperCase() !== tipo) {
+      auth = "";
+      return resposta(false, "Esta conta é de " + r.json.tipo + ". Troque o TIPO.");
+    }
+    usuario = r.json;
+    return resposta(true, "Bem-vindo, " + usuario.nome + "! (servidor " + usuario.servidor + ")", { u: usuario });
+  }
+
+  async function cadastro(tipo, nome, id, senha, url) {
+    base = normalizarURL(url);
+    if (!base) return resposta(false, "Informe o servidor.");
+    if (!nome || !id || !senha) return resposta(false, "Preencha todos os campos.");
+
+    auth = "";   // cadastro não usa autenticação
+    const r = await http("POST", "/usuarios", { id, nome, tipo: tipo.toLowerCase(), senha });
+
+    if (r.http === 201) return resposta(true, "Cadastro feito em " + (r.json.servidor || "servidor") + ". Faça login.");
+    return resposta(false, motivo(r));
+  }
+
+  function sair() {
+    auth = "";
+    usuario = null;
   }
 
 
   /* ---------- Motorista ---------- */
-  function publicar(data, hora, trechos) {
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(data) || !/^\d{2}:\d{2}$/.test(hora))
-      return resposta(false, "Use data AAAA-MM-DD e hora HH:MM.");
+
+  /* Publica UMA carona com vários trechos (POST /api/cliente/rotas), como o terminal. */
+  async function publicar(data, trechos) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(data))
+      return resposta(false, "Use data AAAA-MM-DD.");
     if (!trechos.length)
       return resposta(false, "Adicione ao menos um trecho.");
 
-    caronas.push({
-      id: proxCarona++,
-      motorista: usuarioLogado.email,
-      data,
-      horario: hora,
-      ativa: true,
-      trechos: trechos.map(t => criarTrecho(t.origem, t.destino, t.preco, t.vagas))
+    const r = await http("POST", "/rotas", {
+      trechos: trechos.map(t => ({
+        origem: t.origem, destino: t.destino,
+        horario: data + " " + t.hora,
+        preco: t.preco, assentos: t.vagas
+      }))
     });
-    return resposta(true, "Carona #" + (proxCarona - 1) + " publicada!");
+
+    if (r.http === 201) {
+      const id = r.json.id ? " ID: " + r.json.id : "";
+      return resposta(true, "Rota publicada com " + trechos.length + " trecho(s)." + id);
+    }
+    return resposta(false, motivo(r) + (r.rede ? " Nada foi publicado." : ""));
   }
 
-  function minhasCaronas() {
-    return caronas.filter(c => c.motorista === usuarioLogado.email);
+  async function minhasCaronas() {
+    const r = await http("GET", "/caronas");
+    if (r.http !== 200) return resposta(false, motivo(r), { lista: [] });
+
+    const lista = (r.json.caronas || []).map(c => ({
+      id: c.id,
+      trechos: (c.trechos || []).map(t => ({
+        origem: t.origem, destino: t.destino, horario: t.horario || "",
+        preco: t.preco, vagasTotal: t.assentos, vagasDisp: t.assentos_livres
+      }))
+    }));
+    return resposta(true, "", { lista });
   }
 
-  function cancelarCarona(id) {
-    const carona = caronas.find(c => c.id == id && c.motorista === usuarioLogado.email);
-    if (!carona) return resposta(false, "Carona não encontrada.");
-
-    carona.ativa = false;
-    // cancela também as reservas que usavam esta carona
-    reservas.forEach(r => {
-      if (r.ativa && r.partes.some(p => p.c === carona.id)) cancelarReserva(r.id, true);
-    });
-    return resposta(true, "Carona #" + id + " cancelada.");
+  async function cancelarCarona(id) {
+    if (!id) return resposta(false, "Selecione uma carona.");
+    const r = await http("DELETE", "/caronas/" + encodeURIComponent(id), undefined, 60000);
+    if (r.http === 200) return resposta(true, "Carona excluída. Reservas existentes foram canceladas e os passageiros avisados.");
+    if (r.http === 202) return resposta(true, "Reservas canceladas, mas uma empresa está fora do ar. Repita a exclusão depois.");
+    return resposta(false, motivo(r));
   }
 
 
   /* ---------- Passageiro ---------- */
 
-  /* Busca itinerários de `origem` até `destino` numa data.
-     Faz uma busca em profundidade (DFS) combinando trechos de caronas
-     diferentes, com no máximo 3 trechos, e ordena do mais barato ao mais caro. */
-  function buscar(origem, destino, data) {
+  /* A busca distribuída (vizinhos, ciclos, visitados) é feita pelo servidor. */
+  async function buscar(origem, destino, data) {
     if (!origem || !destino || !data)
       return resposta(false, "Informe data, origem e destino.", { lista: [] });
 
-    const resultados = [];
-    const caronasDoDia = caronas.filter(c => c.ativa && c.data === data);
+    const q = "?origem=" + encodeURIComponent(origem) + "&destino=" + encodeURIComponent(destino);
+    const r = await http("GET", "/itinerarios" + q, undefined, 60000);
+    if (r.http !== 200) return resposta(false, motivo(r), { lista: [] });
 
-    function explorar(local, visitados, percurso, preco) {
-      if (local === destino) {
-        resultados.push({
-          partes: percurso.slice(),
-          preco,
-          rota: [origem, ...percurso.map(p => p.t.destino)].join(" → ")
-        });
-        return;
-      }
-      if (percurso.length >= 3) return;   // limite de 3 trechos
-
-      for (const c of caronasDoDia) {
-        for (const t of c.trechos) {
-          const serve = t.origem === local && t.vagasDisp > 0 && !visitados.includes(t.destino);
-          if (!serve) continue;
-          percurso.push({ c: c.id, t });
-          explorar(t.destino, [...visitados, t.destino], percurso, preco + t.preco);
-          percurso.pop();
-        }
-      }
-    }
-
-    explorar(origem, [origem], [], 0);
-    resultados.sort((a, b) => a.preco - b.preco);
+    const lista = (r.json.itinerarios || [])
+      // sem filtro de data no servidor: aceita trechos da data pedida (ou sem data no horário)
+      .filter(it => it.trechos.every(t => !temData(t.horario) || t.horario.startsWith(data)))
+      .map(it => ({
+        id: it.itinerario_id,
+        preco: it.preco_total,
+        trechos: it.trechos,
+        rota: [it.trechos[0].origem, ...it.trechos.map(t => t.destino)].join(" → ")
+      }));
 
     return resposta(
       true,
-      resultados.length ? resultados.length + " itinerário(s) encontrado(s)." : "Nenhum itinerário para esta data.",
-      { lista: resultados }
+      lista.length ? lista.length + " itinerário(s) encontrado(s)." : "Nenhum itinerário para esta data.",
+      { lista }
     );
   }
 
-  function reservar(itinerario) {
-    if (!itinerario) return resposta(false, "Selecione um itinerário.");
-    if (itinerario.partes.some(p => p.t.vagasDisp <= 0)) return resposta(false, "Sem vagas em algum trecho.");
+  /* O servidor da empresa do passageiro vira coordenador do 2PC. */
+  async function reservar(it) {
+    if (!it) return resposta(false, "Selecione um itinerário.");
 
-    itinerario.partes.forEach(p => { p.t.vagasDisp--; p.t.pax++; });
-    reservas.push({
-      id: proxReserva++,
-      email: usuarioLogado.email,
-      ativa: true,
-      preco: itinerario.preco,
-      rota: itinerario.rota,
-      partes: itinerario.partes.map(p => ({ c: p.c, t: p.t }))
-    });
-    return resposta(true, "Reserva #" + (proxReserva - 1) + " confirmada!");
+    const r = await http("POST", "/reservas", {
+      trechos: it.trechos.map(t => ({
+        servidor: t.servidor, id_carona: t.id_carona,
+        origem: t.origem, destino: t.destino
+      }))
+    }, 60000);
+
+    if (!r.rede)
+      return resposta(false, r.erro + " Resultado DESCONHECIDO: confira em RESERVAS antes de tentar de novo.");
+
+    if (r.http === 201) {
+      gravarMeta(r.json.id_transacao, { rota: it.rota, preco: it.preco });
+      return resposta(true, "Reserva confirmada!" +
+        (r.json.propagacao_pendente ? " (Alguma empresa registra a confirmação em segundo plano.)" : ""));
+    }
+
+    let m = motivo(r);
+    if (r.http === 409) m += " Algum assento foi ocupado; faça uma nova busca.";
+    else if (r.http >= 502 && r.http <= 504) m += " Empresa do trajeto fora do ar; nada foi reservado.";
+    return resposta(false, m);
   }
 
-  function minhasReservas() {
-    return reservas.filter(r => r.email === usuarioLogado.email);
+  async function minhasReservas() {
+    const r = await http("GET", "/reservas");
+    if (r.http !== 200) return resposta(false, motivo(r), { lista: [] });
+
+    const meta = lerMeta();
+    const lista = (r.json.reservas || []).map(x => ({
+      id: x.id_transacao,
+      estado: x.estado,   // PREPARADO | COMITADO | CANCELANDO
+      trechos: (x.itinerario && x.itinerario.length) ? x.itinerario : (x.trechos || []),
+      rota: (meta[x.id_transacao] || {}).rota || "",
+      preco: (meta[x.id_transacao] || {}).preco
+    }));
+    return resposta(true, "", { lista });
   }
 
-  /* `forcar` = true quando o cancelamento vem do motorista (ignora o dono da reserva) */
-  function cancelarReserva(id, forcar) {
-    const r = reservas.find(r => r.id == id && r.ativa && (forcar || r.email === usuarioLogado.email));
-    if (!r) return resposta(false, "Reserva não encontrada.");
+  async function cancelarReserva(id) {
+    if (!id) return resposta(false, "Selecione uma reserva.");
 
-    r.ativa = false;
-    r.partes.forEach(p => { p.t.vagasDisp++; p.t.pax--; });   // devolve as vagas
-    return resposta(true, "Reserva #" + id + " cancelada.");
+    const r = await http("DELETE", "/reservas/" + encodeURIComponent(id), undefined, 60000);
+    if (!r.rede)
+      return resposta(false, r.erro + " Resultado DESCONHECIDO: confira em RESERVAS.");
+    if (r.http === 200) return resposta(true, "Reserva cancelada em todas as empresas.");
+    if (r.http === 202) return resposta(true, "Cancelamento registrado; uma empresa está fora do ar e o servidor conclui quando ela voltar.");
+    return resposta(false, motivo(r));
   }
 
 
   return {
-    login, cadastro,
+    login, cadastro, sair,
     publicar, minhasCaronas, cancelarCarona,
     buscar, reservar, minhasReservas, cancelarReserva
   };

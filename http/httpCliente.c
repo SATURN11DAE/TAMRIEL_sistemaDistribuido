@@ -316,3 +316,17 @@ int clienteCancelar(const char *idVizinho, const char *idTransacao, Resposta *re
 
     return requisicao(idVizinho, "PUT", caminho, NULL, lamportIncrementar(), 8000, resposta);
 }
+
+/*
+ * PUT /reservas/{id}/cancel-motorista: avisa que o motorista cancelou a carona.
+ * O prazo é de 8 s porque o aviso anda pela cadeia de servidores.
+ */
+int clienteCancelarMotorista(const char *idVizinho, const char *idTransacao, Resposta *resposta) {
+    char *t = escapar(idTransacao);
+    char caminho[512];
+
+    snprintf(caminho, sizeof caminho, PREFIXO_CONSORCIO "/reservas/%s/cancel-motorista", t);
+    free(t);
+
+    return requisicao(idVizinho, "PUT", caminho, NULL, lamportIncrementar(), 8000, resposta);
+}

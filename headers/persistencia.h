@@ -42,6 +42,7 @@
 #define ESTADO_PREPARADO   "PREPARADO"    /* assento guardado, aguardando a decisão do coordenador */
 #define ESTADO_COMITADO    "COMITADO"     /* reserva confirmada */
 #define ESTADO_CANCELANDO  "CANCELANDO"   /* cancelamento decidido, ainda propagando aos outros servidores */
+#define ESTADO_CANCELADA_MOTORISTA "CANCELADA_MOTORISTA"  /* motorista excluiu a carona; não ocupa assento */
 
 /* ESTRUTURAS DE DADOS */
 
@@ -76,7 +77,7 @@ typedef struct {
 
 typedef struct {
     char idTransacao[128];
-    char estado[16];             /* ESTADO_PREPARADO, ESTADO_COMITADO ou ESTADO_CANCELANDO */
+    char estado[24];             /* ESTADO_PREPARADO, ESTADO_COMITADO, ESTADO_CANCELANDO ou ESTADO_CANCELADA_MOTORISTA */
     char coordenadorId[MAX_ID];  /* servidor que iniciou a transação */
     char anterior[MAX_ID];       /* servidor que enviou o prepare a este */
     char proximo[MAX_ID];        /* próximo servidor da cadeia ("" se este for o último) */
@@ -112,7 +113,7 @@ int  caronaBuscar(const char *id, Carona *saida);
 int  caronaListar(const char *origem, Carona **lista, int *qtd);
 char *caronasListarJSON(void);
 char *caronasListarJSONDe(const char *motorista);
-/* ARMAZENAMENTO_CONFLITO se a carona tem reservas; _PROIBIDO se pertence a outro motorista. */
+/* ARMAZENAMENTO_CONFLITO se a carona tem reservas ativas (as CANCELADA_MOTORISTA não contam); _PROIBIDO se pertence a outro motorista. */
 int  caronaRemover(const char *id, const char *motorista);
 void caronaJSON(Buffer *buffer, const Carona *c, int incluirLivres);
 
@@ -135,6 +136,8 @@ int  reservaRemover(const char *id);
 /* Remove a reserva sem checar o estado (usado ao concluir um cancelamento). */
 int  reservaApagar(const char *id);
 int  reservaListarPorEstado(const char *estado, Reserva **lista, int *qtd);
+/* Reservas (exceto CANCELANDO) que usam a carona; inclui as já CANCELADA_MOTORISTA. */
+int  reservaListarPorCarona(const char *idCarona, Reserva **lista, int *qtd);
 /* Marca se uma requisição está tratando a transação (ver Reserva.ativo). */
 void reservaAtivo(const char *id, int ativo);
 /* Reservas PREPARADO, inativas e com pelo menos 'idadeMinS' segundos (candidatas à recuperação). */

@@ -35,5 +35,6 @@ int clienteCommitar(const char *idVizinho, const char *idTransacao, Resposta *re
 int clienteRollback(const char *idVizinho, const char *idTransacao, Resposta *resposta);
 int clienteStatus(const char *idVizinho, const char *idTransacao, Resposta *resposta);
 int clienteCancelar(const char *idVizinho, const char *idTransacao, Resposta *resposta);
+int clienteCancelarMotorista(const char *idVizinho, const char *idTransacao, Resposta *resposta);
 
 #endif

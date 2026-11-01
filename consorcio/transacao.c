@@ -14,6 +14,9 @@
  *      recuperação, que pergunta o estado ao servidor anterior da cadeia.
  *
  * Estados de uma reserva: PREPARADO -> COMITADO -> CANCELANDO -> (apagada).
+ * Fora desse fluxo, CANCELADA_MOTORISTA marca a reserva cuja carona foi excluída
+ * pelo motorista: ela deixa de ocupar assento, continua visível ao passageiro e
+ * é apagada quando ele a "cancela" (txCancelar).
  */
 
 #include <stdio.h>
@@ -343,6 +346,7 @@ RespostaServidor txPrepare(const char *corpo, const char *remetente) {
         snprintf(todosTrechos[i].destino, sizeof todosTrechos[i].destino, "%s", destinoTrecho);
     }
     jsonLiberar(json);
+    idTransacao = reservaAtual.idTransacao; 
 
     int k = 0;
     while (k < numTrechos && strcmp(todosTrechos[k].servidor, servidor.id) == 0) {
@@ -415,7 +419,8 @@ RespostaServidor txPrepare(const char *corpo, const char *remetente) {
  * PARTICIPANTE, fase 2: confirma a reserva (PUT /reservas/{id}/commit).
  * Grava COMITADO em disco e repassa o commit ao próximo servidor da cadeia.
  * Retorna 200 (com "propagacao_pendente" = true se o próximo não recebeu;
- * ele se resolve na recuperação), 404 se não houve prepare ou 500 em falha de disco.
+ * ele se resolve na recuperação), 404 se não houve prepare, 409 se o motorista
+ * já cancelou a carona ou 500 em falha de disco.
  */
 RespostaServidor txCommit(const char *idTransacao) {
     printf("[2PC] COMMIT tx=%s\n", idTransacao);
@@ -423,6 +428,9 @@ RespostaServidor txCommit(const char *idTransacao) {
     Reserva reservaAtual;
     if (reservaBuscar(idTransacao, &reservaAtual) != ARMAZENAMENTO_OK) {
         return criarRespostaErro(404, "Transacao desconhecida (nao houve prepare)");
+    }
+    if (strcmp(reservaAtual.estado, ESTADO_CANCELADA_MOTORISTA) == 0) {
+        return criarRespostaErro(409, "Reserva cancelada pelo motorista");
     }
 
     if (reservaDecidir(idTransacao, "COMITADO", NULL, 0) != ARMAZENAMENTO_OK) {
@@ -649,6 +657,8 @@ RespostaServidor txReservarComo(const char *forcado, const char *corpo) {
 
     injetarFalha("antes_decisao");
 
+    /* Se o motorista cancelou a carona durante o prepare, reservaDecidir recusa (CONFLITO)
+     * e o fluxo abaixo desfaz tudo: o passageiro recebe "recusado" e nada fica reservado. */
     if (reservaDecidir(reservaAtual.idTransacao, "COMITADO", agrupamento, qtdAgrupamento) != ARMAZENAMENTO_OK) {
         reservaRemover(reservaAtual.idTransacao);
         propagarComando("rollback", reservaAtual.proximo, reservaAtual.idTransacao);
@@ -749,6 +759,8 @@ RespostaServidor txCancel(const char *idTransacao) {
  * COORDENADOR: cancelamento pedido pelo passageiro (DELETE /reservas/{id}).
  * Só o servidor coordenador e o dono da reserva podem cancelar. Primeiro grava
  * CANCELANDO em disco (a decisão), depois propaga pela cadeia.
+ * Também serve para o passageiro dispensar uma reserva CANCELADA_MOTORISTA: nesse
+ * caso o estado não muda, e a cadeia apenas apaga a cópia de cada servidor.
  * Retorna 200 {"status": "CANCELADA"} se todos cancelaram, 202 {"status": "CANCELANDO"}
  * se algum servidor está fora do ar (a recuperação conclui depois), 404 se a reserva
  * não é dele, 409 se a reserva ainda está em andamento ou 500 em falha de disco.
@@ -787,6 +799,94 @@ RespostaServidor txCancelar(const char *idTransacao, const char *passageiro) {
     bufferAdicionar(&buffer, ", \"status\": \"CANCELANDO\", \"mensagem\": \"Alguma empresa do trajeto esta fora do ar. "
                "O cancelamento esta registrado e sera concluido automaticamente.\"}\n");
     return criarRespostaJSON(202, bufferExtrairTexto(&buffer));
+}
+
+/* Cancelamento pelo motorista (a carona foi excluída) */
+
+/*
+ * Avisa os dois vizinhos da cadeia (anterior e proximo), menos quem enviou,
+ * que a reserva foi cancelada pelo motorista. A cadeia é uma linha, então o
+ * aviso anda nos dois sentidos até as pontas e para sozinho.
+ *   - remetente: servidor que acabou de avisar este ("" se o aviso nasceu aqui)
+ * Retorna 0 se todos os avisos foram entregues, -1 se algum falhou.
+ */
+static int propagarCancelamentoMotorista(const Reserva *reserva, const char *remetente) {
+    const char *destinos[2] = { reserva->anterior, reserva->proximo };
+    int falhou = 0;
+
+    for (int i = 0; i < 2; i++) {
+        if (!destinos[i][0]) continue;
+        if (remetente && remetente[0] && strcmp(destinos[i], remetente) == 0) continue;
+
+        Resposta resp;
+        int rc = clienteCancelarMotorista(destinos[i], reserva->idTransacao, &resp);
+        if (!(rc == 0 && resp.codigoHTTP == 200)) {
+            printf("[2PC] cancel-motorista de %s NAO entregue a %s\n", reserva->idTransacao, destinos[i]);
+            falhou = 1;
+        }
+        respostaLiberar(&resp);
+    }
+    return falhou ? -1 : 0;
+}
+
+/*
+ * PARTICIPANTE: o motorista cancelou a carona (PUT /reservas/{id}/cancel-motorista).
+ * Marca a reserva como CANCELADA_MOTORISTA (libera os assentos) e passa o aviso adiante.
+ *   - remetente: X-Server-Id de quem avisou (não recebe o aviso de volta)
+ * Idempotente. Retorna 200, ou 503 se algum vizinho da cadeia não recebeu.
+ */
+RespostaServidor txCancelarMotorista(const char *idTransacao, const char *remetente) {
+    printf("[2PC] CANCEL-MOTORISTA tx=%s de %s\n", idTransacao, remetente ? remetente : "-");
+
+    Reserva reservaAtual;
+    if (reservaBuscar(idTransacao, &reservaAtual) != ARMAZENAMENTO_OK ||
+        strcmp(reservaAtual.estado, ESTADO_CANCELANDO) == 0) {
+        Buffer b; 
+        bufferIniciar(&b);
+        bufferAdicionar(&b, "{\"id_transacao\": ");
+        bufferAdicionarStringJSON(&b, idTransacao);
+        bufferAdicionar(&b, ", \"mensagem\": \"Nada a fazer aqui.\"}\n");
+        return criarRespostaJSON(200, bufferExtrairTexto(&b));
+    }
+
+    if (reservaDecidir(idTransacao, ESTADO_CANCELADA_MOTORISTA, NULL, 0) != ARMAZENAMENTO_OK) {
+        return criarRespostaErro(500, "Falha ao gravar o cancelamento em disco");
+    }
+
+    if (propagarCancelamentoMotorista(&reservaAtual, remetente) != 0) {
+        return criarRespostaErro(503, "Nao consegui avisar toda a cadeia; tente de novo");
+    }
+
+    Buffer buffer; 
+    bufferIniciar(&buffer);
+    bufferAdicionar(&buffer, "{\"id_transacao\": ");
+    bufferAdicionarStringJSON(&buffer, idTransacao);
+    bufferAdicionar(&buffer, ", \"status\": \"CANCELADA_MOTORISTA\"}\n");
+    return criarRespostaJSON(200, bufferExtrairTexto(&buffer));
+}
+
+/*
+ * Chamado quando o motorista exclui uma carona: marca como CANCELADA_MOTORISTA
+ * todas as reservas que a usam e avisa a cadeia de cada uma.
+ * Retorna quantas reservas NÃO foram totalmente propagadas (0 = tudo certo),
+ * ou -1 em falha interna.
+ */
+int txCancelarReservasDaCarona(const char *idCarona) {
+    Reserva *lista = NULL;
+    int qtd = 0;
+    if (reservaListarPorCarona(idCarona, &lista, &qtd) != ARMAZENAMENTO_OK) return -1;
+
+    int falhas = 0;
+    for (int i = 0; i < qtd; i++) {
+        if (reservaDecidir(lista[i].idTransacao, ESTADO_CANCELADA_MOTORISTA, NULL, 0) != ARMAZENAMENTO_OK) {
+            falhas++;
+            continue;
+        }
+        if (propagarCancelamentoMotorista(&lista[i], "") != 0) falhas++;
+    }
+
+    free(lista);
+    return falhas;
 }
 
 /* Thread de Recuperação (Recovery) */
