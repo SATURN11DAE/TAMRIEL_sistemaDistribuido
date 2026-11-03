@@ -6,7 +6,7 @@ somente com os vizinhos de fronteira por uma API REST. Não existe servidor cent
 
 > **Estado atual:** busca distribuída de itinerários, reserva atômica por commit em duas fases (2PC) em cadeia,
 > precedência por relógio de Lamport (*wait-die*), cancelamento de reservas, autenticação com senha e recuperação de falhas.
-> Ainda faltam o simulador de carga, o teste automatizado combinando carga e falhas e o relatório em PDF no formato SBC (veja [O que falta](#o-que-falta)).
+> Há também cancelamento de carona pelo motorista, front web, simulador de carga e testes automatizados de concorrência, carga e falhas.
 
 ## Sumário
 
@@ -19,11 +19,11 @@ somente com os vizinhos de fronteira por uma API REST. Não existe servidor cent
 7. [Diagramas de sequência](#diagramas-de-sequência)
 8. [Recuperação de falhas](#recuperação-de-falhas)
 9. [Persistência](#persistência)
-10. [Menu de testes e cliente de terminal](#menu-de-testes-e-cliente-de-terminal)
-11. [Exemplo completo com curl](#exemplo-completo-com-curl)
-12. [Testes](#testes)
-13. [Relatório técnico](#relatório-técnico)
-14. [O que falta](#o-que-falta)
+10. [Front web](#front-web)
+11. [Menu de testes e cliente de terminal](#menu-de-testes-e-cliente-de-terminal)
+12. [Exemplo completo com curl](#exemplo-completo-com-curl)
+13. [Testes](#testes)
+14. [Relatório técnico](#relatório-técnico)
 
 ---
 
@@ -130,9 +130,8 @@ Makefile               gera `servidor` e `cliente`
 Dockerfile             imagem Ubuntu 22.04 com as dependências
 docker-compose.yml     um serviço por região, rede interna e volumes de dados
 headers/               cabeçalhos de todos os módulos (documentados)
-cliServidor/
-  cli.c                menu de texto do servidor (testes)
-cliUsuario/
+cli/
+  cliServidor.c        menu de texto do servidor (testes)
   terminal.c           cliente interativo de passageiros e motoristas
   apiConsorcio.c       chamadas à API do cliente (libcurl)
 http/
@@ -150,7 +149,10 @@ util/
   json.c               parser JSON (árvore em memória)
   util.c               buffer de texto, UUID, validação de ids, tempo
 testes/
+  comum.py             utilitários compartilhados (HTTP, preparação, auditoria, relatório)
   concorrencia.py      disputa simultânea por assentos (veja "Testes")
+  carga.py             passageiros virtuais com carga alta e contínua
+  falhas.py            a mesma carga com injeção de falhas nos servidores
 ```
 
 ---
@@ -168,8 +170,10 @@ testes/
 - **Usuário** é cadastrado em **uma** empresa e só fala com o servidor dela. O servidor dele vira o **coordenador** das reservas que ele fizer.
 - Os servidores só conversam com **vizinhos de fronteira** (tabela de regiões).
 
-Estados de uma reserva em cada servidor: `PREPARADO` (assento guardado, aguardando decisão), `COMITADO` (confirmada)
-e `CANCELANDO` (cancelamento decidido, ainda se propagando). Uma reserva abortada ou cancelada é simplesmente apagada.
+Estados de uma reserva em cada servidor: `PREPARADO` (assento guardado, aguardando decisão), `COMITADO` (confirmada),
+`CANCELANDO` (cancelamento decidido pelo passageiro, ainda se propagando) e `CANCELADA_MOTORISTA` (o motorista excluiu a carona:
+a reserva deixa de ocupar assento, continua visível ao passageiro e só some quando ele a "cancela").
+Uma reserva abortada ou cancelada pelo passageiro é simplesmente apagada.
 
 ```mermaid
 stateDiagram-v2
@@ -178,6 +182,9 @@ stateDiagram-v2
     PREPARADO --> [*]: rollback / aborto
     COMITADO --> CANCELANDO: cancelamento pedido pelo passageiro
     CANCELANDO --> [*]: cancelamento concluído na cadeia
+    PREPARADO --> CANCELADA_MOTORISTA: motorista exclui a carona
+    COMITADO --> CANCELADA_MOTORISTA: motorista exclui a carona
+    CANCELADA_MOTORISTA --> [*]: passageiro dispensa o aviso
 ```
 
 ---
@@ -194,7 +201,7 @@ Credenciais inválidas retornam **401** (com atraso de 0,3 s contra força bruta
 | `GET /itinerarios?origem=&destino=` | ambos | busca distribuída (consulta os vizinhos) | 200, 400 |
 | `POST /rotas` ou `POST /caronas` | motorista | publica uma carona com vários trechos (os dois caminhos fazem o mesmo) | 201, 400, 403, 500 |
 | `GET /caronas` | motorista | lista as caronas do motorista com `assentos_livres` | 200 |
-| `DELETE /caronas/{id}` | motorista | exclui a carona (só sem reservas) | 200, 400, 403 (de outro motorista), 404, 409 (tem reservas) |
+| `DELETE /caronas/{id}` | motorista | exclui a carona; as reservas dela viram `CANCELADA_MOTORISTA` e a cadeia é avisada | 200, 202 (alguma empresa fora do ar: repita), 400, 403 (de outro motorista), 404, 409 (entrou reserva durante a exclusão: repita), 500 |
 | `POST /reservas` | passageiro | reserva um itinerário (2PC) | 201, 400, 403, 404, 409, 502, 500 |
 | `GET /reservas` | passageiro | reservas do passageiro em que este servidor é o coordenador | 200 |
 | `DELETE /reservas/{id}` | passageiro | cancela uma reserva confirmada | 200, 202, 404, 409, 500 |
@@ -304,6 +311,8 @@ na hora de receber o aviso. Ela conclui sozinha ao voltar (veja [Recuperação d
 | 409 | erro | reserva ainda em andamento (`PREPARADO`); tente de novo em instantes |
 | 500 | erro | falha ao gravar o cancelamento em disco |
 
+Se a reserva está `CANCELADA_MOTORISTA`, o `DELETE` apenas a dispensa: o estado não muda e a cadeia só apaga a cópia de cada servidor.
+
 ---
 
 ## API entre servidores (consórcio)
@@ -320,10 +329,11 @@ Quem recebe atualiza o relógio com `max(local, recebido) + 1`. As respostas tam
 | `GET /trechos?origem=&destino=&visitados=a,b` | itinerários cujo 1º trecho é uma carona deste servidor | 200, 400 |
 | `GET /reservas` | reservas guardadas neste servidor | 200 |
 | `POST /reservas/prepare` | fase 1: tranca assentos, repassa à cadeia e vota | 200 READY, 400, 404, 409, 500, 502 |
-| `PUT /reservas/{id}/commit` | fase 2: confirma e repassa à cadeia | 200, 404, 500 |
+| `PUT /reservas/{id}/commit` | fase 2: confirma e repassa à cadeia | 200, 404, 409 (carona cancelada pelo motorista), 500 |
 | `DELETE /reservas/{id}` | rollback: apaga a reserva e repassa à cadeia (idempotente) | 200, 409 (já confirmada), 500 |
 | `GET /reservas/{id}/status` | estado da transação (usado na recuperação) | 200, 404 |
-| `PUT /reservas/{id}/cancel` | cancela uma reserva confirmada e repassa à cadeia (idempotente) | 200, 503, 404 |
+| `PUT /reservas/{id}/cancel` | cancela uma reserva confirmada e repassa à cadeia (idempotente) | 200, 503 |
+| `PUT /reservas/{id}/cancel-motorista` | o motorista excluiu a carona: marca `CANCELADA_MOTORISTA` e avisa os dois vizinhos da cadeia (idempotente) | 200, 500, 503 |
 
 Rotas desconhecidas retornam 404. Identificadores com caracteres fora de letras, números, `-`, `_` e `.` são rejeitados.
 
@@ -365,7 +375,8 @@ servidor apaga a própria reserva antes de responder NO.
 
 ### `PUT /reservas/{id}/commit`
 
-200 `{"id_transacao", "mensagem", "propagacao_pendente"}`. 404 se nunca houve `prepare`. Grava `COMITADO` e repassa ao próximo.
+200 `{"id_transacao", "mensagem", "propagacao_pendente"}`. 404 se nunca houve `prepare`. 409 se o motorista já cancelou a carona
+(um `commit` atrasado nunca ressuscita a reserva). Grava `COMITADO` e repassa ao próximo.
 
 ### `DELETE /reservas/{id}` (rollback)
 
@@ -374,12 +385,19 @@ para que um aborto atrasado nunca desfaça uma transação confirmada.
 
 ### `GET /reservas/{id}/status`
 
-200 `{"id_transacao", "status": "PREPARADO" | "COMITADO" | "CANCELANDO", "coordenador_id"}` ou 404 (desconhecida ou abortada).
+200 `{"id_transacao", "status": "PREPARADO" | "COMITADO" | "CANCELANDO" | "CANCELADA_MOTORISTA", "coordenador_id"}` ou 404 (desconhecida ou abortada).
 
 ### `PUT /reservas/{id}/cancel`
 
 Repassa o cancelamento adiante **primeiro** e só então apaga a cópia local, então os assentos são liberados do fim da cadeia para o começo.
 200 `{"id_transacao", "mensagem"}` (também se a reserva já não existe aqui). **503** se não conseguiu concluir adiante; quem chamou tenta de novo.
+
+### `PUT /reservas/{id}/cancel-motorista`
+
+Chamada quando o motorista exclui uma carona. Marca a reserva como `CANCELADA_MOTORISTA` (libera os assentos) e avisa o `anterior` e o `proximo`
+da cadeia, menos quem enviou o aviso (`X-Server-Id`), então o aviso anda nos dois sentidos até as pontas e para sozinho.
+200 `{"id_transacao", "status": "CANCELADA_MOTORISTA"}`, ou 200 "Nada a fazer aqui" se a reserva não existe ou já está `CANCELANDO`.
+**503** se algum vizinho não recebeu o aviso (o motorista repete a exclusão); 500 em falha de disco.
 
 ### Tempos limite
 
@@ -388,7 +406,7 @@ Repassa o cancelamento adiante **primeiro** e só então apaga a cópia local, e
 | `TIMEOUT_CONEXAO` | 1,5 s | estabelecer a conexão com um vizinho |
 | `TIMEOUT_REQUISICAO` | 3 s | requisição comum |
 | `prepare` | (3 s + 0,8 s) × servidores restantes | a chamada é encadeada, então o prazo cresce com a cadeia |
-| cancelamento | 8 s | propaga pela cadeia inteira |
+| cancelamento (passageiro ou motorista) | 8 s | propaga pela cadeia inteira |
 | `ESPERA_MAX_MS` | 0,8 s | espera máxima por um assento disputado |
 | `SUSPEITA_MS` | 5 s | quanto tempo um vizinho sem resposta fica "suspeito" |
 | `TIMEOUT_PREPARADO_S` | 5 s | idade mínima de uma reserva `PREPARADO` para a recuperação agir |
@@ -550,6 +568,22 @@ Em Docker, monte `json/` como volume (já feito no `docker-compose.yml`).
 
 ---
 
+## Front web
+
+Além do cliente de terminal, há um front web (arquivos `mapa.js`, `painel.js`, `api.js`, `login.js`, `dados.js` e `estado.js`) que fala só com
+`/api/cliente` do servidor da empresa do usuário, por HTTP Basic. Os servidores devolvem cabeçalhos CORS, então a página pode ser servida
+de qualquer origem (por exemplo, com `python3 -m http.server` na pasta do front).
+
+- **Login e cadastro:** o campo SERVIDOR recebe a URL da empresa (padrão `http://localhost:3001`). A conta precisa ser do tipo escolhido (passageiro ou motorista).
+- **Mapa:** imagem de Tamriel (`img/mapa.webp`) com os locais de `dados.js`; origem e destino são escolhidos clicando, com zoom e arraste.
+- **Passageiro:** abas BUSCAR, ROTAS e RESERVAS (busca, escolha do itinerário, reserva e cancelamento). Reservas `CANCELADA_MOTORISTA` aparecem sinalizadas.
+- **Motorista:** abas PUBLICAR (monta a rota trecho a trecho e publica com `POST /rotas`) e MINHAS CARONAS (lista e exclusão).
+- **Data:** o servidor não tem campo de data. O front a grava dentro do `horario` (`"2026-11-01 08:00"`) e, na busca, filtra os trechos pela data escolhida.
+- **Rota e preço das reservas** ficam no `localStorage` do navegador (o servidor só guarda ids e assentos), então não aparecem em outro navegador.
+- **Resultado desconhecido:** se a rede cair no meio de uma reserva ou de um cancelamento, a tela avisa para conferir em RESERVAS.
+
+---
+
 ## Menu de testes e cliente de terminal
 
 Ao iniciar, cada **servidor** abre um menu no terminal (em Docker, `docker attach <servidor>`). As opções 1 a 8 chamam a API entre
@@ -622,6 +656,19 @@ dos outros servidores voltam a ficar livres. Para simular um servidor travado:
 
 ## Testes
 
+Os scripts ficam em `testes/`, usam só a biblioteca padrão do Python 3.8+ e compartilham o `comum.py` (requisições HTTP, preparação de caronas
+e passageiros, auditoria das invariantes e relatório). Compile antes com `make`.
+
+| Script | Servidores | O que faz |
+|---|---|---|
+| `concorrencia.py` | já rodando (`skyrim`, `morrowind`, `cyrodiil` em localhost) | disputas simultâneas por assentos |
+| `carga.py` | já rodando | passageiros virtuais que buscam, reservam e cancelam sem parar |
+| `falhas.py` | **sobe os próprios** (o executável `./servidor`) | a mesma carga com queda e trava de servidores |
+
+Os três terminam com código 0 se todas as invariantes se mantiveram e 1 caso contrário.
+
+### Concorrência
+
 `testes/concorrencia.py` precisa de `skyrim`, `morrowind` e `cyrodiil` rodando em localhost. A cada rodada cria caronas novas com
 **um único assento** e dispara reservas simultâneas por coordenadores diferentes:
 
@@ -633,6 +680,43 @@ Cenários: (`unico`) três coordenadores disputam o último assento da mesma car
 caronas em ordem oposta; (`sobreposto`) quatro reservas com cadeias que se sobrepõem. Ao fim de cada rodada audita: nenhum assento
 duplicado, nenhum overbooking, nenhuma reserva `PREPARADO` sobrando e nenhuma reserva confirmada pela metade.
 Resultado esperado: `confirmadas_por_rodada={1: N}` e `violacoes=0`.
+
+### Carga contínua
+
+```bash
+python3 testes/carga.py
+python3 testes/carga.py --passageiros 60 --duracao 60 --capacidade 15 --saida resultados/carga.json
+```
+
+Sobe N passageiros espalhados pelos três servidores; cada um fica em laço buscando itinerários, reservando e, com probabilidade `--cancelar`,
+cancelando. Há mais passageiros que assentos, então as disputas pelos últimos assentos são constantes. Ao fim espera a recuperação e imprime
+vazão e latência (p50, p95, p99 e máximo) por operação, os códigos HTTP e a auditoria. Use `--semente` para repetir uma execução.
+
+### Falhas durante a carga
+
+```bash
+python3 testes/falhas.py
+python3 testes/falhas.py --cenarios participante_cai caos --duracao 40 --semente 123
+```
+
+O script sobe `skyrim`, `morrowind` e `cyrodiil` num diretório temporário limpo, liga a carga e injeta a falha. **Encerre antes qualquer servidor ou
+contêiner que use as portas 3001 a 3003** (por exemplo, `docker compose down`): o teste aborta se encontrar a porta em uso. Os dados e logs de um cenário
+reprovado ficam no diretório temporário indicado na saída.
+
+| Cenário | Falha |
+|---|---|
+| `participante_cai` | `SIGKILL` no `morrowind` no meio da carga; ele volta 6 s depois |
+| `participante_trava` | `SIGSTOP` no `cyrodiil` por 6 s (travado, não caído) |
+| `coordenador_antes_decisao` | `skyrim` cai após os votos READY e antes de gravar o COMMIT |
+| `coordenador_depois_decisao` | `skyrim` cai após gravar o COMMIT e antes de avisar os participantes |
+| `cancelamento_interrompido` | `skyrim` cai após gravar `CANCELANDO`, antes de propagar |
+| `caos` | a cada poucos segundos, um servidor aleatório cai ou trava |
+
+### O que a auditoria confere
+
+Depois da recuperação, o `comum.py` lê o estado de cada servidor e confere: todos responderam; nenhum assento vendido duas vezes; nenhum trecho com mais reservas
+que assentos; nenhuma reserva presa em `PREPARADO`/`CANCELANDO`; nenhuma reserva confirmada pela metade ou órfã; toda reserva confirmada ao passageiro existe;
+toda reserva cancelada sumiu de todas as empresas; e nenhuma confirmação que o passageiro não conhece.
 
 ---
 
@@ -665,7 +749,7 @@ Resumo das decisões de projeto, base para o relatório no formato SBC.
 | Privacidade e independência | todas as empresas cedem os dados | nenhum dado sai do servidor da empresa dona |
 | Complexidade | baixa | alta: parcialidade de falhas, recuperação e idempotência |
 
-A comparação quantitativa (latência e vazão sob carga) será preenchida com as medições do simulador, que ainda não existe.
+A comparação quantitativa (latência e vazão sob carga) deve usar as medições do `carga.py` (veja [Testes](#testes)).
 
 ### Decisões de projeto
 
@@ -734,12 +818,3 @@ não explodir. É uma fotografia sem reserva; a disponibilidade real só é deci
 - Tanenbaum, A. S.; Van Steen, M. *Distributed Systems.* 3. ed., 2017.
 - Moriarty, K.; Kaliski, B.; Rusch, A. *PKCS #5: Password-Based Cryptography Specification Version 2.1.* RFC 8018, 2017.
 - Reschke, J. *The 'Basic' HTTP Authentication Scheme.* RFC 7617, 2015.
-
----
-
-## O que falta
-
-- Simulador de passageiros com carga alta e contínua (geração autônoma de buscas e reservas)
-- Teste automatizado completo que combine carga **e** injeção de falhas (derrubar ou travar servidores durante a carga e checar as três
-  invariantes depois da recuperação); o `concorrencia.py` e o `INJETAR_FALHA` são a base
-- Relatório em PDF no formato SBC e comparação quantitativa com a arquitetura centralizada do Problema 1
