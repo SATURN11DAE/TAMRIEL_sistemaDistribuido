@@ -1,0 +1,53 @@
+{
+  "titulo": "Carga contínua (30 passageiros, 10 assentos/trecho)",
+  "duracao_s": 31.38,
+  "estabilizou": true,
+  "tempo_estabilizar_s": 0.01,
+  "operacoes": {
+    "busca": {
+      "total": 307,
+      "por_segundo": 9.78,
+      "codigos": {
+        "200": 307
+      },
+      "p50_ms": 1257.4,
+      "p95_ms": 4366.8,
+      "p99_ms": 6169.7,
+      "max_ms": 7191.8
+    },
+    "reserva": {
+      "total": 134,
+      "por_segundo": 4.27,
+      "codigos": {
+        "201": 82,
+        "409": 52
+      },
+      "p50_ms": 1779.3,
+      "p95_ms": 5207.0,
+      "p99_ms": 6247.9,
+      "max_ms": 6319.8
+    },
+    "cancelamento": {
+      "total": 43,
+      "por_segundo": 1.37,
+      "codigos": {
+        "200": 43
+      },
+      "p50_ms": 1724.9,
+      "p95_ms": 3115.8,
+      "p99_ms": 4024.3,
+      "max_ms": 4024.3
+    }
+  },
+  "buscas_sem_itinerario": 173,
+  "violacoes": [],
+  "avisos": [],
+  "resumo": {
+    "reservas_em_disco": 39,
+    "comitadas": 39,
+    "confirmadas_ao_passageiro": 39,
+    "canceladas": 43,
+    "sem_resposta_conclusiva": 0
+  },
+  "aprovado": true
+}

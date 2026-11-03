@@ -1,0 +1,59 @@
+/*
+ * Ponto de entrada do servidor do consórcio
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <unistd.h>
+#include <curl/curl.h>
+
+#include "headers/configuracoes.h"
+#include "headers/persistencia.h"
+#include "headers/httpServidor.h"
+#include "headers/cli.h"
+#include "headers/transacao.h"
+
+int main(int argc, char *argv[]) {
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
+    if (argc < 2) {
+        printf("Uso: %s <regiao> [porta]\n\n", argv[0]);
+        listarRegioes();
+        return 1;
+    }
+
+    if (configuracoesCarregar(argv[1], argc >= 3 ? atoi(argv[2]) : 0) != 0) {
+        printf("Regiao '%s' desconhecida.\n\n", argv[1]);
+        listarRegioes();
+        return 1;
+    }
+
+    srand((unsigned) time(NULL) ^ (unsigned) getpid());
+
+    if (armazenamentoIniciar() != ARMAZENAMENTO_OK) {
+        printf("Erro ao iniciar o armazenamento em '%s/'.\n", PASTA_JSON);
+        return 1;
+    }
+    curl_global_init(CURL_GLOBAL_ALL);
+
+    printf("Iniciando servidor '%s' na porta %d (%d vizinhos)...\n",
+           servidor.id, servidor.porta, servidor.qtdVizinhos);
+
+    struct MHD_Daemon *daemon = servidorHTTPIniciar(servidor.porta);
+    if (!daemon) {
+        printf("Erro ao iniciar o servidor HTTP (porta %d em uso?).\n", servidor.porta);
+        curl_global_cleanup();
+        return 1;
+    }
+
+    txRecuperacaoIniciar();
+    cliExecutar();
+    txRecuperacaoParar();
+    
+    servidorHTTPParar(daemon);
+    armazenamentoEncerrar();
+    curl_global_cleanup();
+    
+    return 0;
+}

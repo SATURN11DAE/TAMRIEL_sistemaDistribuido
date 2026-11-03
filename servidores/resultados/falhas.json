@@ -1,0 +1,351 @@
+{
+  "semente": 11,
+  "cenarios": [
+    {
+      "titulo": "participante_cai",
+      "duracao_s": 30.31,
+      "estabilizou": true,
+      "tempo_estabilizar_s": 0.0,
+      "operacoes": {
+        "busca": {
+          "total": 1781,
+          "por_segundo": 58.77,
+          "codigos": {
+            "200": 1572,
+            "rede": 209
+          },
+          "p50_ms": 130.4,
+          "p95_ms": 227.9,
+          "p99_ms": 334.3,
+          "max_ms": 434.8
+        },
+        "reserva": {
+          "total": 94,
+          "por_segundo": 3.1,
+          "codigos": {
+            "201": 69,
+            "409": 25
+          },
+          "p50_ms": 249.5,
+          "p95_ms": 363.1,
+          "p99_ms": 383.9,
+          "max_ms": 383.9
+        },
+        "cancelamento": {
+          "total": 35,
+          "por_segundo": 1.15,
+          "codigos": {
+            "200": 35
+          },
+          "p50_ms": 241.9,
+          "p95_ms": 336.8,
+          "p99_ms": 344.6,
+          "max_ms": 344.6
+        }
+      },
+      "buscas_sem_itinerario": 1478,
+      "violacoes": [],
+      "avisos": [],
+      "resumo": {
+        "reservas_em_disco": 34,
+        "comitadas": 34,
+        "confirmadas_ao_passageiro": 34,
+        "canceladas": 35,
+        "sem_resposta_conclusiva": 0
+      },
+      "aprovado": true,
+      "falha_disparou": true,
+      "diretorio": "/tmp/vaijunto-participante_cai-bza51_2f"
+    },
+    {
+      "titulo": "participante_trava",
+      "duracao_s": 30.39,
+      "estabilizou": true,
+      "tempo_estabilizar_s": 0.01,
+      "operacoes": {
+        "busca": {
+          "total": 1110,
+          "por_segundo": 36.53,
+          "codigos": {
+            "200": 1110
+          },
+          "p50_ms": 240.7,
+          "p95_ms": 382.8,
+          "p99_ms": 3108.3,
+          "max_ms": 6256.2
+        },
+        "reserva": {
+          "total": 178,
+          "por_segundo": 5.86,
+          "codigos": {
+            "201": 81,
+            "409": 97
+          },
+          "p50_ms": 281.4,
+          "p95_ms": 387.1,
+          "p99_ms": 451.8,
+          "max_ms": 451.9
+        },
+        "cancelamento": {
+          "total": 50,
+          "por_segundo": 1.65,
+          "codigos": {
+            "200": 50
+          },
+          "p50_ms": 288.5,
+          "p95_ms": 368.6,
+          "p99_ms": 6178.0,
+          "max_ms": 6178.0
+        }
+      },
+      "buscas_sem_itinerario": 932,
+      "violacoes": [],
+      "avisos": [],
+      "resumo": {
+        "reservas_em_disco": 31,
+        "comitadas": 31,
+        "confirmadas_ao_passageiro": 31,
+        "canceladas": 50,
+        "sem_resposta_conclusiva": 0
+      },
+      "aprovado": true,
+      "falha_disparou": true,
+      "diretorio": "/tmp/vaijunto-participante_trava-wzkxxxtn"
+    },
+    {
+      "titulo": "coordenador_antes_decisao",
+      "duracao_s": 30.54,
+      "estabilizou": true,
+      "tempo_estabilizar_s": 0.01,
+      "operacoes": {
+        "busca": {
+          "total": 1050,
+          "por_segundo": 34.39,
+          "codigos": {
+            "200": 938,
+            "rede": 112
+          },
+          "p50_ms": 365.0,
+          "p95_ms": 568.2,
+          "p99_ms": 677.2,
+          "max_ms": 914.3
+        },
+        "reserva": {
+          "total": 99,
+          "por_segundo": 3.24,
+          "codigos": {
+            "201": 58,
+            "409": 37,
+            "502": 1,
+            "rede": 3
+          },
+          "p50_ms": 315.1,
+          "p95_ms": 502.2,
+          "p99_ms": 530.2,
+          "max_ms": 530.2
+        },
+        "cancelamento": {
+          "total": 25,
+          "por_segundo": 0.82,
+          "codigos": {
+            "200": 25
+          },
+          "p50_ms": 322.7,
+          "p95_ms": 458.5,
+          "p99_ms": 554.3,
+          "max_ms": 554.3
+        }
+      },
+      "buscas_sem_itinerario": 839,
+      "violacoes": [],
+      "avisos": [],
+      "resumo": {
+        "reservas_em_disco": 33,
+        "comitadas": 33,
+        "confirmadas_ao_passageiro": 33,
+        "canceladas": 25,
+        "sem_resposta_conclusiva": 3
+      },
+      "aprovado": true,
+      "falha_disparou": true,
+      "diretorio": "/tmp/vaijunto-coordenador_antes_decisao-98a7e_l8"
+    },
+    {
+      "titulo": "coordenador_depois_decisao",
+      "duracao_s": 30.46,
+      "estabilizou": true,
+      "tempo_estabilizar_s": 0.01,
+      "operacoes": {
+        "busca": {
+          "total": 845,
+          "por_segundo": 27.74,
+          "codigos": {
+            "200": 739,
+            "rede": 106
+          },
+          "p50_ms": 484.9,
+          "p95_ms": 855.4,
+          "p99_ms": 1068.7,
+          "max_ms": 1227.4
+        },
+        "reserva": {
+          "total": 84,
+          "por_segundo": 2.76,
+          "codigos": {
+            "201": 53,
+            "409": 27,
+            "502": 1,
+            "rede": 3
+          },
+          "p50_ms": 377.0,
+          "p95_ms": 592.1,
+          "p99_ms": 682.0,
+          "max_ms": 682.0
+        },
+        "cancelamento": {
+          "total": 25,
+          "por_segundo": 0.82,
+          "codigos": {
+            "200": 25
+          },
+          "p50_ms": 404.8,
+          "p95_ms": 563.9,
+          "p99_ms": 610.8,
+          "max_ms": 610.8
+        }
+      },
+      "buscas_sem_itinerario": 655,
+      "violacoes": [],
+      "avisos": [
+        "1 reserva(s) confirmada(s) sem resposta ao passageiro (explicadas pelas 3 requisições sem resposta conclusiva)"
+      ],
+      "resumo": {
+        "reservas_em_disco": 29,
+        "comitadas": 29,
+        "confirmadas_ao_passageiro": 28,
+        "canceladas": 25,
+        "sem_resposta_conclusiva": 3
+      },
+      "aprovado": true,
+      "falha_disparou": true,
+      "diretorio": "/tmp/vaijunto-coordenador_depois_decisao-novkkoiv"
+    },
+    {
+      "titulo": "cancelamento_interrompido",
+      "duracao_s": 30.75,
+      "estabilizou": true,
+      "tempo_estabilizar_s": 0.0,
+      "operacoes": {
+        "busca": {
+          "total": 660,
+          "por_segundo": 21.46,
+          "codigos": {
+            "200": 550,
+            "rede": 110
+          },
+          "p50_ms": 411.7,
+          "p95_ms": 615.8,
+          "p99_ms": 728.2,
+          "max_ms": 996.7
+        },
+        "reserva": {
+          "total": 429,
+          "por_segundo": 13.95,
+          "codigos": {
+            "201": 234,
+            "409": 195
+          },
+          "p50_ms": 423.4,
+          "p95_ms": 588.9,
+          "p99_ms": 658.1,
+          "max_ms": 763.7
+        },
+        "cancelamento": {
+          "total": 213,
+          "por_segundo": 6.93,
+          "codigos": {
+            "200": 204,
+            "202": 2,
+            "rede": 7
+          },
+          "p50_ms": 411.4,
+          "p95_ms": 578.8,
+          "p99_ms": 628.4,
+          "max_ms": 686.8
+        }
+      },
+      "buscas_sem_itinerario": 121,
+      "violacoes": [],
+      "avisos": [],
+      "resumo": {
+        "reservas_em_disco": 27,
+        "comitadas": 27,
+        "confirmadas_ao_passageiro": 21,
+        "canceladas": 206,
+        "sem_resposta_conclusiva": 0
+      },
+      "aprovado": true,
+      "falha_disparou": true,
+      "diretorio": "/tmp/vaijunto-cancelamento_interrompido-_e4hz_bi"
+    },
+    {
+      "titulo": "caos",
+      "duracao_s": 30.41,
+      "estabilizou": true,
+      "tempo_estabilizar_s": 0.01,
+      "operacoes": {
+        "busca": {
+          "total": 1457,
+          "por_segundo": 47.91,
+          "codigos": {
+            "200": 1009,
+            "rede": 448
+          },
+          "p50_ms": 179.3,
+          "p95_ms": 478.1,
+          "p99_ms": 721.7,
+          "max_ms": 1283.1
+        },
+        "reserva": {
+          "total": 75,
+          "por_segundo": 2.47,
+          "codigos": {
+            "201": 47,
+            "409": 18,
+            "502": 3,
+            "rede": 7
+          },
+          "p50_ms": 455.7,
+          "p95_ms": 1004.4,
+          "p99_ms": 1261.7,
+          "max_ms": 1261.7
+        },
+        "cancelamento": {
+          "total": 21,
+          "por_segundo": 0.69,
+          "codigos": {
+            "200": 19,
+            "rede": 2
+          },
+          "p50_ms": 497.5,
+          "p95_ms": 899.4,
+          "p99_ms": 1037.1,
+          "max_ms": 1037.1
+        }
+      },
+      "buscas_sem_itinerario": 934,
+      "violacoes": [],
+      "avisos": [],
+      "resumo": {
+        "reservas_em_disco": 28,
+        "comitadas": 28,
+        "confirmadas_ao_passageiro": 26,
+        "canceladas": 19,
+        "sem_resposta_conclusiva": 7
+      },
+      "aprovado": true,
+      "falha_disparou": true,
+      "diretorio": "/tmp/vaijunto-caos-ptd13pf7"
+    }
+  ]
+}
