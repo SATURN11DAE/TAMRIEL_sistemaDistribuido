@@ -6,7 +6,8 @@ somente com os vizinhos de fronteira por uma API REST. Não existe servidor cent
 
 > **Estado atual:** busca distribuída de itinerários, reserva atômica por commit em duas fases (2PC) em cadeia,
 > precedência por relógio de Lamport (*wait-die*), cancelamento de reservas, autenticação com senha e recuperação de falhas.
-> Há também cancelamento de carona pelo motorista, front web, simulador de carga e testes automatizados de concorrência, carga e falhas.
+> Há também cancelamento de carona pelo motorista, front web, simulador de carga e testes automatizados de concorrência, carga e falhas,
+> com os [resultados das execuções](#resultados-dos-testes) documentados neste README.
 
 ## Sumário
 
@@ -26,9 +27,10 @@ somente com os vizinhos de fronteira por uma API REST. Não existe servidor cent
 14. [Menu de testes e cliente de terminal](#menu-de-testes-e-cliente-de-terminal)
 15. [Exemplo completo com curl](#exemplo-completo-com-curl)
 16. [Testes automatizados](#testes-automatizados)
-17. [Emulação com Docker em várias máquinas](#emulação-com-docker-em-várias-máquinas)
-18. [Decisões de projeto e limitações](#decisões-de-projeto-e-limitações)
-19. [Referências](#referências)
+17. [Resultados dos testes](#resultados-dos-testes)
+18. [Emulação com Docker em várias máquinas](#emulação-com-docker-em-várias-máquinas)
+19. [Decisões de projeto e limitações](#decisões-de-projeto-e-limitações)
+20. [Referências](#referências)
 
 ---
 
@@ -136,9 +138,13 @@ util/
   util.c               buffer de texto, UUID, validação de ids, tempo
 testes/
   comum.py             utilitários compartilhados (HTTP, preparação, auditoria, relatório)
-  concorrencia.py      disputa simultânea por assentos
+  concorrencia.py      corridas dirigidas (disputa por assentos, deadlock, cancelamento duplo, churn, exclusão de carona)
   carga.py             passageiros virtuais com carga alta e contínua
   falhas.py            a mesma carga com injeção de falhas nos servidores
+resultados/
+  concorrencia.json    resultado da última execução de concorrencia.py (veja "Resultados dos testes")
+  carga.json           resultado da última execução de carga.py
+  falhas.json          resultado da última execução de falhas.py
 ```
 
 ---
@@ -840,31 +846,40 @@ dos outros servidores voltam a ficar livres. Para simular um servidor travado:
 ## Testes automatizados
 
 Os scripts ficam em `testes/`, usam só a biblioteca padrão do Python 3.8+ e compartilham o `comum.py` (requisições HTTP, preparação de caronas
-e passageiros, auditoria das invariantes e relatório). Compile antes com `make`.
+e passageiros, auditoria das invariantes e relatório). Compile antes com `make`. Os resultados de uma execução de cada script
+estão em [Resultados dos testes](#resultados-dos-testes).
 
 | Script | Foco | Servidores | O que faz |
 |---|---|---|---|
-| `concorrencia.py` | exclusão mútua e deadlock | já rodando (`skyrim`, `morrowind`, `cyrodiil` em localhost) | disputas simultâneas por assentos entre coordenadores diferentes |
+| `concorrencia.py` | exclusão mútua, deadlock e cancelamentos concorrentes | já rodando (`skyrim`, `morrowind`, `cyrodiil` em localhost) | corridas montadas de propósito, com todas as requisições liberadas no mesmo instante e um monitor lendo o estado a cada 100 ms |
 | `carga.py` | desempenho e contenção | já rodando | passageiros virtuais que buscam, reservam e cancelam sem parar |
 | `falhas.py` | tolerância a falhas e recuperação | **sobe os próprios** (o executável `./servidor`) | a mesma carga com queda e trava de servidores |
 
-Os três terminam com código 0 se todas as invariantes se mantiveram e 1 caso contrário.
+Os três terminam com código 0 se todas as invariantes se mantiveram e 1 caso contrário (o `concorrencia.py` ainda devolve 2 se os servidores não respondem).
 
 ### Concorrência
 
-A cada rodada cria caronas novas com **um único assento** e dispara reservas simultâneas por coordenadores diferentes:
+Cada cenário monta uma disputa específica e solta todas as requisições juntas, por uma barreira. Durante todo o cenário, um **monitor**
+lê o estado dos três servidores a cada 100 ms e confere, em cada leitura, que nenhum assento foi dado a duas reservas e que nenhum trecho
+passou da capacidade (vale também para reservas ainda `PREPARADO`, não só no fim). Ao final roda a auditoria de sempre.
+Cada cenário roda `--rodadas` vezes (padrão 3), cada uma com cidades e caronas novas.
 
 ```bash
-python3 testes/concorrencia.py 20      # 20 rodadas de cada cenário
+python3 testes/concorrencia.py
+python3 testes/concorrencia.py --cenarios cruzada churn_um_assento --rodadas 5
+python3 testes/concorrencia.py --passageiros 24 --duracao 20 --semente 123 --verbose --saida resultados/concorrencia.json
 ```
 
 | Cenário | O que testa |
 |---|---|
-| `unico` | três coordenadores disputam o último assento da mesma carona (exclusão mútua e precedência) |
-| `cruzado` | duas reservas travam as mesmas duas caronas em ordem oposta (ausência de deadlock) |
-| `sobreposto` | quatro reservas com cadeias que se sobrepõem (atomicidade sob contenção) |
+| `ultimo_assento` | N passageiros, nos 3 servidores, disputam ao mesmo tempo os mesmos assentos de um trecho: nunca pode vender mais do que existe |
+| `cruzada` | reservas que seguram assentos em ordens **opostas** (skyrim→morrowind e morrowind→skyrim): precisa resolver sem travar (deadlock) |
+| `cancelamento_duplo` | vários `DELETE` da **mesma** reserva ao mesmo tempo: nada de erro 5xx e o assento tem de ficar livre em todas as empresas |
+| `churn_um_assento` | reservar e cancelar sem parar disputando **um** assento |
+| `exclusao_carona` | o motorista exclui a carona enquanto passageiros reservam nela |
 
-Resultado esperado: `confirmadas_por_rodada={1: N}` (exatamente uma confirmada por rodada) e `violacoes=0`.
+Resultado esperado: todas as rodadas `OK` e nenhuma linha `[PROBLEMA]`. Opções úteis: `--passageiros` (padrão 12), `--duracao` dos cenários
+contínuos (padrão 10 s), `--semente` para repetir uma execução e `--verbose` para o relatório completo de todas as rodadas.
 
 ### Carga contínua
 
@@ -881,7 +896,7 @@ vazão e latência (p50, p95, p99 e máximo) por operação, os códigos HTTP e 
 
 ```bash
 python3 testes/falhas.py
-python3 testes/falhas.py --cenarios participante_cai caos --duracao 40 --semente 123
+python3 testes/falhas.py --cenarios participante_cai caos --duracao 40 --semente 123 --saida resultados/falhas.json
 ```
 
 O script sobe `skyrim`, `morrowind` e `cyrodiil` num diretório temporário limpo, liga a carga e injeta a falha. **Encerre antes qualquer servidor ou
@@ -902,6 +917,472 @@ reprovado ficam no diretório temporário indicado na saída.
 Depois da recuperação, o `comum.py` lê o estado de cada servidor e confere: todos responderam; nenhum assento vendido duas vezes; nenhum trecho com mais reservas
 que assentos; nenhuma reserva presa em `PREPARADO`/`CANCELANDO`; nenhuma reserva confirmada pela metade ou órfã; toda reserva confirmada ao passageiro existe;
 toda reserva cancelada sumiu de todas as empresas; e nenhuma confirmação que o passageiro não conhece.
+
+---
+
+## Resultados dos testes
+
+Esta seção registra uma execução de cada script, com os três servidores (`skyrim`, `morrowind`, `cyrodiil`) em `localhost`. Os arquivos
+`resultados/*.json` guardam os números completos; os logs de cada execução aparecem abaixo, dentro de blocos recolhíveis.
+
+### Resumo
+
+| Script | Correção (invariantes) | Desempenho | Observação principal |
+|---|---|---|---|
+| `concorrencia.py` | **aprovado** (5 cenários × 3 rodadas) | duas anomalias de latência | `exclusao_carona` muito mais lento que o previsto e com 5xx; `churn_um_assento` rodada 3 com pico de latência |
+| `falhas.py` | **aprovado** (6 cenários, a falha ocorreu em todos) | p99 de ~3 a 4 s nas janelas de falha | nenhuma invariante violada, mesmo com o coordenador caindo nos pontos críticos do 2PC |
+| `carga.py` | **aprovado** | **ruim nesta execução** | 57 s em vez de 30 s, 0,81 buscas/s e timeouts de 30 s |
+
+**Conclusão geral.** A *segurança* (correção) se manteve em todas as execuções: nenhum assento vendido duas vezes, nenhum overbooking, nenhuma reserva
+presa ou pela metade, mesmo com quedas e travas nos pontos mais críticos do commit em duas fases. A *vivacidade* (desempenho sob estresse) tem
+três pontos a investigar: a execução do `carga.py`, a `exclusao_carona` e a rodada 3 do `churn_um_assento`. Os três têm o mesmo sintoma
+(esperas longas, algumas até o timeout). Uma causa comum, como contenção de trava ou espera por um participante, é uma **hipótese**: os resultados
+mostram o sintoma, não a origem.
+
+### Como ler os números
+
+| Campo | Significado |
+|---|---|
+| `p50` / `p95` / `p99` / `máx` | latência: o caso típico, os piores casos e a requisição mais lenta |
+| `201` | reserva criada e confirmada |
+| `200` | busca ou cancelamento concluído |
+| `202` | cancelamento aceito, com propagação ainda pendente |
+| `409` | recusa normal (sem assento ou conflito) |
+| `502` / `500` | erro falando com outra empresa / erro do servidor |
+| `rede` | sem resposta (timeout ou conexão falhou): o resultado real da operação é **desconhecido** |
+| `buscas sem itinerário` | buscas que não acharam nada porque as caronas lotaram (esperado com mais passageiros que assentos) |
+
+### Concorrência (`concorrencia.py`)
+
+Semente `819097283`. Cada cenário foi executado em 3 rodadas, todas aprovadas.
+
+| Cenário | Rodadas | Resultado | O que os números mostram |
+|---|---|---|---|
+| `ultimo_assento` | 3 | APROVADO | com 2, 3 e 1 assento(s) para 12 passageiros, ganharam **exatamente** 2, 3 e 1 (201); os demais receberam 409 |
+| `cruzada` | 3 | APROVADO | 1 vencedor e 5 recusas por rodada, em ~0,4 a 0,5 s: nenhuma requisição travou (sem deadlock) |
+| `cancelamento_duplo` | 3 | APROVADO | 8 `DELETE` simultâneos devolveram 200 em todas as rodadas, sem 5xx, e o assento ficou livre nas três empresas |
+| `churn_um_assento` | 3 | APROVADO | 13, 11 e 8 reservas confirmadas e canceladas no assento disputado; **rodada 3 mais lenta** |
+| `exclusao_carona` | 3 | APROVADO | reservas da carona excluída ficaram `CANCELADA_MOTORISTA` em todas as empresas; **muito lento e com 5xx** |
+
+**Pontos de atenção**
+
+- **`churn_um_assento`, rodada 3:** durou 17,9 s (as outras, ~10,5 s), com vazão de 18 reservas/s (contra ~39/s), p99 de 6,0 s e máximo de 7,1 s.
+  Nenhuma regra foi violada.
+- **`exclusao_carona`:** o cenário deveria durar ~10 s e levou 29,6 s, 45,7 s e 13,2 s. Houve latências de até 18 s, erros 502 (7 na rodada 1, 2 na rodada 3)
+  e um 500 na rodada 3. O teste não trata 5xx como problema neste cenário (só confere consistência), então passa mesmo assim.
+- O aviso "N reservas usavam a carona quando ela foi excluída" é só informativo: todas terminaram consistentes entre as empresas.
+
+<details>
+<summary>Log completo de <code>concorrencia.py</code></summary>
+
+```text
+Semente: 819097283 (use --semente 819097283 para repetir)
+
+==============================================================================
+CENÁRIO ultimo_assento: N passageiros disputam o mesmo trecho ao mesmo tempo
+  rodada 1: OK  (4 leituras do monitor, 1.1s)
+  rodada 2: OK  (3 leituras do monitor, 0.8s)
+  rodada 3: OK  (3 leituras do monitor, 0.8s)
+
+==============================================================================
+CENÁRIO cruzada: reservas segurando assentos em ordens opostas (risco de deadlock)
+  rodada 1: OK  (3 leituras do monitor, 0.4s)
+  rodada 2: OK  (4 leituras do monitor, 0.5s)
+  rodada 3: OK  (3 leituras do monitor, 0.4s)
+
+==============================================================================
+CENÁRIO cancelamento_duplo: vários DELETE simultâneos da mesma reserva
+  rodada 1: OK  (8 leituras do monitor, 1.2s)
+  rodada 2: OK  (7 leituras do monitor, 1.1s)
+  rodada 3: OK  (8 leituras do monitor, 1.0s)
+
+==============================================================================
+CENÁRIO churn_um_assento: reservar e cancelar sem parar disputando um assento
+  rodada 1: OK  (44 leituras do monitor, 10.9s)
+    aviso: 13 reservas confirmadas e canceladas no assento disputado
+  rodada 2: OK  (40 leituras do monitor, 10.6s)
+    aviso: 11 reservas confirmadas e canceladas no assento disputado
+  rodada 3: OK  (26 leituras do monitor, 17.9s)
+    aviso: 8 reservas confirmadas e canceladas no assento disputado
+
+==============================================================================
+CENÁRIO exclusao_carona: motorista exclui a carona enquanto passageiros reservam
+  rodada 1: OK  (16 leituras do monitor, 29.6s)
+    aviso: 3 reserva(s) usavam a carona quando ela foi excluída
+  rodada 2: OK  (53 leituras do monitor, 45.7s)
+    aviso: 18 reserva(s) usavam a carona quando ela foi excluída
+  rodada 3: OK  (32 leituras do monitor, 13.2s)
+    aviso: 11 reserva(s) usavam a carona quando ela foi excluída
+
+==============================================================================
+RESUMO
+------------------------------------------------------------------------------
+cenário                   rodadas  aprovadas   resultado
+ultimo_assento                  3          3   APROVADO
+cruzada                         3          3   APROVADO
+cancelamento_duplo              3          3   APROVADO
+churn_um_assento                3          3   APROVADO
+exclusao_carona                 3          3   APROVADO
+
+Resultados gravados em resultados/concorrencia.json
+```
+
+</details>
+
+### Falhas durante a carga (`falhas.py`)
+
+Semente `628653643`; 20 passageiros, 8 assentos por trecho, ~30 s de carga por cenário. Em **todos** os cenários a falha de fato aconteceu
+durante a carga e as 8 invariantes da auditoria passaram.
+
+| Cenário | Falha injetada | Confirmadas (201) | Violações | Resultado |
+|---|---|---|---|---|
+| `participante_cai` | `SIGKILL` no morrowind; volta 6 s depois | 55 | 0 | APROVADO |
+| `participante_trava` | `SIGSTOP` no cyrodiil por 6 s | 54 | 0 | APROVADO |
+| `coordenador_antes_decisao` | skyrim cai após os votos READY, antes do COMMIT | 80 | 0 | APROVADO |
+| `coordenador_depois_decisao` | skyrim cai após gravar o COMMIT, antes de avisar | 67 | 0 | APROVADO |
+| `cancelamento_interrompido` | skyrim cai após gravar `CANCELANDO`, antes de propagar | 244 | 0 | APROVADO |
+| `caos` | quedas e travas aleatórias ao longo da carga | 57 | 0 | APROVADO |
+
+**Latência e vazão por cenário**
+
+| Cenário | Duração | Buscas/s | Reservas (201 / 409 / 502 / rede) | Cancelamentos (200 / 202 / rede) | p99 busca | máx busca |
+|---|---|---|---|---|---|---|
+| `participante_cai` | 30,4 s | 59,15 | 55 / 40 / 0 / 0 | 22 / 0 / 0 | 469 ms | 743 ms |
+| `participante_trava` | 30,3 s | 40,95 | 54 / 33 / 0 / 0 | 24 / 0 / 0 | 3132 ms | 6276 ms |
+| `coordenador_antes_decisao` | 30,4 s | 34,14 | 80 / 19 / 3 / 7 | 44 / 0 / 0 | 600 ms | 826 ms |
+| `coordenador_depois_decisao` | 30,3 s | 41,58 | 67 / 35 / 1 / 4 | 35 / 0 / 0 | 525 ms | 613 ms |
+| `cancelamento_interrompido` | 30,9 s | 29,39 | 244 / 171 / 0 / 0 | 214 / 2 / 6 | 493 ms | 577 ms |
+| `caos` | 33,1 s | 35,60 | 57 / 33 / 1 / 0 | 27 / 0 / 0 | 4093 ms | 4374 ms |
+
+**Como cada falha se refletiu nos resultados**
+
+- **`participante_cai`:** as 210 buscas com erro de `rede` são as feitas ao morrowind enquanto ele estava fora. Reservas e cancelamentos não tiveram erro de rede.
+- **`participante_trava`:** nenhum erro de rede. As requisições ao servidor congelado ficaram esperando e voltaram ao descongelar, o que aparece no máximo de 6,3 s nas buscas.
+- **`coordenador_antes_decisao`:** 7 reservas sem resposta e 3 com 502, efeito direto da queda do coordenador. Ao final nenhuma reserva ficou presa em `PREPARADO`
+  e o disco bate com o que foi confirmado (36 = 36).
+- **`coordenador_depois_decisao`:** uma reserva ficou confirmada no disco sem o passageiro saber (33 em disco, 32 confirmadas ao passageiro). É o
+  comportamento esperado para este ponto de falha: a decisão `COMITADO` já era durável, então a reserva vale mesmo que a resposta tenha se perdido.
+- **`cancelamento_interrompido`** (aqui a chance de cancelar foi de 90%): o `202` (2 vezes) é o sistema informando que o cancelamento foi aceito mas a propagação está pendente.
+  Ao final, nenhuma reserva presa em `CANCELANDO` e toda reserva cancelada sumiu de todas as empresas.
+- **`caos`:** o p50 continua normal, mas o p99 sobe para ~4 s nas janelas de falha. Mesmo com quatro falhas em sequência, nenhuma invariante foi violada.
+
+**Limites desta execução**
+
+- O "tempo de recuperação até estabilizar" aparece como 0,0 s em todos os cenários, mas isso provavelmente **não mede a recuperação de verdade**: o script
+  já espera os servidores ficarem saudáveis (`curar()`) antes de medir.
+- Cada falha é injetada uma única vez por cenário (exceto no `caos`). Falhas repetidas ou simultâneas em dois servidores só são cobertas de forma aleatória.
+- A auditoria olha o estado só no **fim**: uma inconsistência que aparecesse e sumisse durante a carga não seria vista (o `concorrencia.py`, com monitor contínuo, cobre melhor isso).
+- A "busca sem itinerário" é alta (por exemplo 1491 de 1796) porque 20 passageiros e 8 assentos lotam as caronas rápido. É esperado, mas reduz o tempo útil de disputa por assentos.
+
+<details>
+<summary>Log completo de <code>falhas.py</code></summary>
+
+```text
+Semente: 628653643 (use --semente 628653643 para repetir)
+
+==============================================================================
+CENÁRIO participante_cai: SIGKILL no morrowind (participante) no meio da carga
+  dados e logs em /tmp/vaijunto-participante_cai-j6fnt44e
+  carona skyrim-cbce9300 em skyrim: A-lrd39 -> B-lrd39 -> C-lrd39
+  carona morrowind-84ea11dd em morrowind: B-lrd39 -> C-lrd39 -> D-lrd39
+  carona cyrodiil-d9b1707c em cyrodiil: C-lrd39 -> D-lrd39
+  20 passageiros cadastrados (skyrim, morrowind, cyrodiil)
+  >> SIGKILL em morrowind
+  >> morrowind volta
+Carga encerrada; religando o que sobrou e esperando a recuperação ...
+
+=== participante_cai ===
+Duração da carga: 30.4s | recuperação até estabilizar: 0.0s
+
+operação         total   req/s      p50      p95      p99      máx   códigos
+busca             1796   59.15     114ms    289ms    469ms    743ms   200:1586 rede:210
+reserva             95    3.13     279ms    417ms    480ms    480ms   201:55 409:40
+cancelamento        22    0.72     278ms    382ms    412ms    412ms   200:22
+buscas sem itinerário (tudo lotado): 1491
+reservas confirmadas: 55/95  (1.81/s)
+
+Invariantes:
+  [OK ] Todos os servidores responderam à auditoria
+  [OK ] Exclusão mútua: nenhum assento vendido duas vezes
+  [OK ] Nenhum trecho com mais reservas que assentos
+  [OK ] Nenhuma reserva presa em PREPARADO/CANCELANDO
+  [OK ] Atomicidade: nenhuma reserva confirmada pela metade ou órfã
+  [OK ] Durabilidade: toda reserva confirmada ao passageiro existe
+  [OK ] Toda reserva cancelada sumiu de todas as empresas
+  [OK ] Nenhuma confirmação que o passageiro não conhece
+
+Resumo: {'reservas_em_disco': 33, 'comitadas': 33, 'confirmadas_ao_passageiro': 33, 'canceladas': 22, 'sem_resposta_conclusiva': 0}
+RESULTADO: APROVADO
+
+==============================================================================
+CENÁRIO participante_trava: SIGSTOP no cyrodiil: servidor travado, não caído
+  dados e logs em /tmp/vaijunto-participante_trava-0pkmabmw
+  carona skyrim-472fb90e em skyrim: A-pkdrk -> B-pkdrk -> C-pkdrk
+  carona morrowind-00e94c7c em morrowind: B-pkdrk -> C-pkdrk -> D-pkdrk
+  carona cyrodiil-b219c497 em cyrodiil: C-pkdrk -> D-pkdrk
+  20 passageiros cadastrados (skyrim, morrowind, cyrodiil)
+  >> SIGSTOP em cyrodiil
+  >> cyrodiil destravado (SIGCONT)
+Carga encerrada; religando o que sobrou e esperando a recuperação ...
+
+=== participante_trava ===
+Duração da carga: 30.3s | recuperação até estabilizar: 0.0s
+
+operação         total   req/s      p50      p95      p99      máx   códigos
+busca             1242   40.95     177ms    420ms   3132ms   6276ms   200:1242
+reserva             87    2.87     330ms    465ms    566ms    566ms   201:54 409:33
+cancelamento        24    0.79     280ms    530ms    683ms    683ms   200:24
+buscas sem itinerário (tudo lotado): 1155
+reservas confirmadas: 54/87  (1.78/s)
+
+Invariantes:
+  [OK ] Todos os servidores responderam à auditoria
+  [OK ] Exclusão mútua: nenhum assento vendido duas vezes
+  [OK ] Nenhum trecho com mais reservas que assentos
+  [OK ] Nenhuma reserva presa em PREPARADO/CANCELANDO
+  [OK ] Atomicidade: nenhuma reserva confirmada pela metade ou órfã
+  [OK ] Durabilidade: toda reserva confirmada ao passageiro existe
+  [OK ] Toda reserva cancelada sumiu de todas as empresas
+  [OK ] Nenhuma confirmação que o passageiro não conhece
+
+Resumo: {'reservas_em_disco': 30, 'comitadas': 30, 'confirmadas_ao_passageiro': 30, 'canceladas': 24, 'sem_resposta_conclusiva': 0}
+RESULTADO: APROVADO
+
+==============================================================================
+CENÁRIO coordenador_antes_decisao: skyrim cai depois dos votos READY e antes de gravar o COMMIT
+  dados e logs em /tmp/vaijunto-coordenador_antes_decisao-mbglbum6
+  carona skyrim-b9086ec3 em skyrim: A-c8dn8 -> B-c8dn8 -> C-c8dn8
+  carona morrowind-d8942632 em morrowind: B-c8dn8 -> C-c8dn8 -> D-c8dn8
+  carona cyrodiil-3c1f1b9b em cyrodiil: C-c8dn8 -> D-c8dn8
+  20 passageiros cadastrados (skyrim, morrowind, cyrodiil)
+  >> skyrim caiu pela injeção; religando em 3 s
+Carga encerrada; religando o que sobrou e esperando a recuperação ...
+
+=== coordenador_antes_decisao ===
+Duração da carga: 30.4s | recuperação até estabilizar: 0.0s
+
+operação         total   req/s      p50      p95      p99      máx   códigos
+busca             1038   34.14     370ms    529ms    600ms    826ms   200:926 rede:112
+reserva            109    3.58     292ms    536ms    543ms    661ms   201:80 409:19 502:3 rede:7
+cancelamento        44    1.45     302ms    541ms    588ms    588ms   200:44
+buscas sem itinerário (tudo lotado): 817
+reservas confirmadas: 80/109  (2.63/s)
+
+Invariantes:
+  [OK ] Todos os servidores responderam à auditoria
+  [OK ] Exclusão mútua: nenhum assento vendido duas vezes
+  [OK ] Nenhum trecho com mais reservas que assentos
+  [OK ] Nenhuma reserva presa em PREPARADO/CANCELANDO
+  [OK ] Atomicidade: nenhuma reserva confirmada pela metade ou órfã
+  [OK ] Durabilidade: toda reserva confirmada ao passageiro existe
+  [OK ] Toda reserva cancelada sumiu de todas as empresas
+  [OK ] Nenhuma confirmação que o passageiro não conhece
+
+Resumo: {'reservas_em_disco': 36, 'comitadas': 36, 'confirmadas_ao_passageiro': 36, 'canceladas': 44, 'sem_resposta_conclusiva': 7}
+RESULTADO: APROVADO
+
+==============================================================================
+CENÁRIO coordenador_depois_decisao: skyrim cai depois de gravar o COMMIT e antes de avisar os participantes
+  dados e logs em /tmp/vaijunto-coordenador_depois_decisao-7nwkmg8l
+  carona skyrim-4fa7cd58 em skyrim: A-ycmvj -> B-ycmvj -> C-ycmvj
+  carona morrowind-c00fee0e em morrowind: B-ycmvj -> C-ycmvj -> D-ycmvj
+  carona cyrodiil-74ca223c em cyrodiil: C-ycmvj -> D-ycmvj
+  20 passageiros cadastrados (skyrim, morrowind, cyrodiil)
+  >> skyrim caiu pela injeção; religando em 3 s
+Carga encerrada; religando o que sobrou e esperando a recuperação ...
+
+=== coordenador_depois_decisao ===
+Duração da carga: 30.3s | recuperação até estabilizar: 0.0s
+
+operação         total   req/s      p50      p95      p99      máx   códigos
+busca             1261   41.58     244ms    439ms    525ms    613ms   200:1149 rede:112
+reserva            107    3.53     324ms    504ms    576ms    576ms   201:67 409:35 502:1 rede:4
+cancelamento        35    1.15     371ms    501ms    529ms    529ms   200:35
+buscas sem itinerário (tudo lotado): 1042
+reservas confirmadas: 67/107  (2.21/s)
+
+Invariantes:
+  [OK ] Todos os servidores responderam à auditoria
+  [OK ] Exclusão mútua: nenhum assento vendido duas vezes
+  [OK ] Nenhum trecho com mais reservas que assentos
+  [OK ] Nenhuma reserva presa em PREPARADO/CANCELANDO
+  [OK ] Atomicidade: nenhuma reserva confirmada pela metade ou órfã
+  [OK ] Durabilidade: toda reserva confirmada ao passageiro existe
+  [OK ] Toda reserva cancelada sumiu de todas as empresas
+  [OK ] Nenhuma confirmação que o passageiro não conhece
+  aviso: 1 reserva(s) confirmada(s) sem resposta ao passageiro (explicadas pelas 4 requisições sem resposta conclusiva)
+
+Resumo: {'reservas_em_disco': 33, 'comitadas': 33, 'confirmadas_ao_passageiro': 32, 'canceladas': 35, 'sem_resposta_conclusiva': 4}
+RESULTADO: APROVADO
+
+==============================================================================
+CENÁRIO cancelamento_interrompido: skyrim cai depois de gravar CANCELANDO, antes de propagar
+  dados e logs em /tmp/vaijunto-cancelamento_interrompido-hnt8lelg
+  carona skyrim-99204ce7 em skyrim: A-4ndf0 -> B-4ndf0 -> C-4ndf0
+  carona morrowind-65621afb em morrowind: B-4ndf0 -> C-4ndf0 -> D-4ndf0
+  carona cyrodiil-f2ca13f5 em cyrodiil: C-4ndf0 -> D-4ndf0
+  20 passageiros cadastrados (skyrim, morrowind, cyrodiil)
+  >> skyrim caiu pela injeção; religando em 3 s
+Carga encerrada; religando o que sobrou e esperando a recuperação ...
+
+=== cancelamento_interrompido ===
+Duração da carga: 30.9s | recuperação até estabilizar: 0.0s
+
+operação         total   req/s      p50      p95      p99      máx   códigos
+busca              909   29.39     309ms    444ms    493ms    577ms   200:799 rede:110
+reserva            415   13.42     323ms    457ms    519ms    576ms   201:244 409:171
+cancelamento       222    7.18     304ms    425ms    534ms    582ms   200:214 202:2 rede:6
+buscas sem itinerário (tudo lotado): 384
+reservas confirmadas: 244/415  (7.89/s)
+
+Invariantes:
+  [OK ] Todos os servidores responderam à auditoria
+  [OK ] Exclusão mútua: nenhum assento vendido duas vezes
+  [OK ] Nenhum trecho com mais reservas que assentos
+  [OK ] Nenhuma reserva presa em PREPARADO/CANCELANDO
+  [OK ] Atomicidade: nenhuma reserva confirmada pela metade ou órfã
+  [OK ] Durabilidade: toda reserva confirmada ao passageiro existe
+  [OK ] Toda reserva cancelada sumiu de todas as empresas
+  [OK ] Nenhuma confirmação que o passageiro não conhece
+
+Resumo: {'reservas_em_disco': 27, 'comitadas': 27, 'confirmadas_ao_passageiro': 22, 'canceladas': 216, 'sem_resposta_conclusiva': 0}
+RESULTADO: APROVADO
+
+==============================================================================
+CENÁRIO caos: servidores aleatórios caem ou travam ao longo da carga
+  dados e logs em /tmp/vaijunto-caos-sa5o6z5i
+  carona skyrim-46990ee9 em skyrim: A-bhfu6 -> B-bhfu6 -> C-bhfu6
+  carona morrowind-2e8565d3 em morrowind: B-bhfu6 -> C-bhfu6 -> D-bhfu6
+  carona cyrodiil-ac62abe4 em cyrodiil: C-bhfu6 -> D-bhfu6
+  20 passageiros cadastrados (skyrim, morrowind, cyrodiil)
+  >> SIGSTOP em skyrim por 4.0s
+  >> SIGKILL em cyrodiil por 2.3s
+  >> SIGKILL em morrowind por 3.1s
+  >> SIGSTOP em skyrim por 4.2s
+Carga encerrada; religando o que sobrou e esperando a recuperação ...
+
+=== caos ===
+Duração da carga: 33.1s | recuperação até estabilizar: 0.0s
+
+operação         total   req/s      p50      p95      p99      máx   códigos
+busca             1180    35.6     205ms    507ms   4093ms   4374ms   200:998 rede:182
+reserva             91    2.75     428ms    591ms   4329ms   4329ms   201:57 409:33 502:1
+cancelamento        27    0.81     395ms    570ms   4282ms   4282ms   200:27
+buscas sem itinerário (tudo lotado): 907
+reservas confirmadas: 57/91  (1.72/s)
+
+Invariantes:
+  [OK ] Todos os servidores responderam à auditoria
+  [OK ] Exclusão mútua: nenhum assento vendido duas vezes
+  [OK ] Nenhum trecho com mais reservas que assentos
+  [OK ] Nenhuma reserva presa em PREPARADO/CANCELANDO
+  [OK ] Atomicidade: nenhuma reserva confirmada pela metade ou órfã
+  [OK ] Durabilidade: toda reserva confirmada ao passageiro existe
+  [OK ] Toda reserva cancelada sumiu de todas as empresas
+  [OK ] Nenhuma confirmação que o passageiro não conhece
+
+Resumo: {'reservas_em_disco': 30, 'comitadas': 30, 'confirmadas_ao_passageiro': 30, 'canceladas': 27, 'sem_resposta_conclusiva': 0}
+RESULTADO: APROVADO
+
+==============================================================================
+RESUMO
+------------------------------------------------------------------------------
+cenário                         falha ocorreu  confirmadas  violações   resultado
+participante_cai                          sim           55          0   APROVADO
+participante_trava                        sim           54          0   APROVADO
+coordenador_antes_decisao                 sim           80          0   APROVADO
+coordenador_depois_decisao                sim           67          0   APROVADO
+cancelamento_interrompido                 sim          244          0   APROVADO
+caos                                      sim           57          0   APROVADO
+
+Resultados gravados em resultados/falhas.json
+```
+
+</details>
+
+### Carga contínua (`carga.py`)
+
+Configuração: 30 passageiros por 30 s, 10 assentos por trecho, `cancelar=0.5`, timeout de 30 s por requisição.
+
+| Operação | Total | Req/s | p50 | p95 | p99 | máx | Códigos |
+|---|---|---|---|---|---|---|---|
+| busca | 46 | 0,81 | 691 ms | 28009 ms | 30032 ms | 30032 ms | 200:44 rede:2 |
+| reserva | 38 | 0,67 | 19244 ms | 30032 ms | 30032 ms | 30032 ms | 201:19 409:1 502:7 rede:11 |
+| cancelamento | 10 | 0,18 | 10051 ms | 30031 ms | 30031 ms | 30031 ms | 200:9 rede:1 |
+
+Resumo da auditoria: `reservas_em_disco: 11`, `comitadas: 11`, `confirmadas_ao_passageiro: 9`, `canceladas: 9`, `sem_resposta_conclusiva: 11`.
+**Resultado: APROVADO** (todas as 8 invariantes OK).
+
+**Leitura**
+
+- **Correção:** nenhuma invariante foi violada, mesmo com requisições estourando o timeout. O aviso de "2 reservas confirmadas sem resposta ao passageiro" é o
+  caso clássico do cliente que não recebe a resposta: o servidor concluiu a reserva e gravou em disco, mas a resposta se perdeu. As 11 requisições sem resposta
+  explicam as 2 reservas (11 em disco, 9 confirmadas ao passageiro). Nada foi perdido nem duplicado.
+- **Desempenho (problema):** a carga deveria durar 30 s e durou **57,1 s**, porque havia requisições penduradas e o teste só termina quando elas acabam.
+  A vazão foi de 0,81 buscas/s, contra 30 a 60/s do `falhas.py` com o mesmo sistema. Os valores de ~30.031 ms são exatamente o timeout de 30 s,
+  e o p50 das reservas foi de 19 s. Só metade das reservas deu certo (19 de 38).
+- **Causa:** não aparece neste log. Timeouts iguais ao limite indicam algo bloqueado esperando (por exemplo uma trava, ou um participante do commit que não respondia),
+  mas isso é hipótese. Para investigar: olhar os logs dos três servidores durante a execução, repetir a mesma carga para ver se reproduz
+  e comparar com uma rodada menor (`--passageiros 10`) para achar a partir de qual carga o sistema degrada.
+
+<details>
+<summary>Log completo de <code>carga.py</code></summary>
+
+```text
+Preparando a rodada em localhost ...
+  carona skyrim-77d13ec0 em skyrim: A-orpko -> B-orpko -> C-orpko
+  carona morrowind-a63f7a6a em morrowind: B-orpko -> C-orpko -> D-orpko
+  carona cyrodiil-aeeff84c em cyrodiil: C-orpko -> D-orpko
+  30 passageiros cadastrados (skyrim, morrowind, cyrodiil)
+
+Carga: 30 passageiros por 30s (10 assentos por trecho, cancelar=0.5)
+Carga encerrada; esperando a recuperação e conferindo o estado ...
+
+=== Carga contínua (30 passageiros, 10 assentos/trecho) ===
+Duração da carga: 57.1s | recuperação até estabilizar: 0.0s
+
+operação         total   req/s      p50      p95      p99      máx   códigos
+busca               46    0.81     691ms  28009ms  30032ms  30032ms   200:44 rede:2
+reserva             38    0.67   19244ms  30032ms  30032ms  30032ms   201:19 409:1 502:7 rede:11
+cancelamento        10    0.18   10051ms  30031ms  30031ms  30031ms   200:9 rede:1
+buscas sem itinerário (tudo lotado): 6
+reservas confirmadas: 19/38  (0.33/s)
+
+Invariantes:
+  [OK ] Todos os servidores responderam à auditoria
+  [OK ] Exclusão mútua: nenhum assento vendido duas vezes
+  [OK ] Nenhum trecho com mais reservas que assentos
+  [OK ] Nenhuma reserva presa em PREPARADO/CANCELANDO
+  [OK ] Atomicidade: nenhuma reserva confirmada pela metade ou órfã
+  [OK ] Durabilidade: toda reserva confirmada ao passageiro existe
+  [OK ] Toda reserva cancelada sumiu de todas as empresas
+  [OK ] Nenhuma confirmação que o passageiro não conhece
+  aviso: 2 reserva(s) confirmada(s) sem resposta ao passageiro (explicadas pelas 11 requisições sem resposta conclusiva)
+
+Resumo: {'reservas_em_disco': 11, 'comitadas': 11, 'confirmadas_ao_passageiro': 9, 'canceladas': 9, 'sem_resposta_conclusiva': 11}
+RESULTADO: APROVADO
+
+Resultado gravado em resultados/carga.json
+```
+
+</details>
+
+### Cobertura e limites dos testes
+
+| Garantia do projeto | Onde é exercitada | Resultado |
+|---|---|---|
+| Exclusão mútua do assento | `ultimo_assento`, `churn_um_assento`, auditoria de todos os scripts | nenhuma violação |
+| Sem deadlock (*wait-die*) | `cruzada` | 1 vencedor por rodada, sem travar |
+| Atomicidade do 2PC | auditoria (atomicidade e durabilidade) em todos os scripts | nenhuma violação |
+| Recuperação com o coordenador caído | `coordenador_antes_decisao`, `coordenador_depois_decisao` | convergiu, sem reserva presa |
+| Cancelamento idempotente e recuperável | `cancelamento_duplo`, `cancelamento_interrompido` | sem 5xx; sem reserva presa em `CANCELANDO` |
+| Exclusão de carona pelo motorista | `exclusao_carona` | consistente em todas as empresas; **lento e com 5xx** |
+| Participante caído ou travado | `participante_cai`, `participante_trava`, `caos` | convergiu |
+| Desempenho sob carga alta | `carga.py` | **degradado nesta execução** (ver acima) |
+
+O que estes testes **não** provam: cada falha é injetada uma vez por cenário (exceto no `caos`); a auditoria do `falhas.py` só olha o fim da execução; as execuções
+são em uma única máquina (`localhost`), então não exercitam atrasos e partições reais de rede; e os números de latência de uma execução
+isolada variam entre execuções (a rodada 3 do `churn_um_assento` mostra isso). Para comparar execuções, use `--semente`.
 
 ---
 
@@ -987,6 +1468,9 @@ confira o IP, o firewall e se o outro servidor está no ar.
 - **Disponibilidade da busca:** a busca é *best effort*; empresas suspeitas são puladas e podem faltar opções nos resultados.
 - **Prazos fixos:** os timeouts são constantes de compilação, não adaptativos.
 - **Recusa conservadora sob contenção:** o *wait-die* pode recusar uma reserva mais nova que teria assento depois; o passageiro precisa repetir.
+- **Desempenho sob carga alta e na exclusão de carona:** nas execuções registradas em [Resultados dos testes](#resultados-dos-testes), a `carga.py`
+  (30 passageiros) e a `exclusao_carona` tiveram esperas de até 30 s, com erros 502/500 na segunda. A causa ainda não foi identificada. A consistência
+  se manteve, mas a vivacidade sob alta contenção é um ponto aberto.
 
 ---
 
