@@ -1,6 +1,6 @@
 # VaiJunto: Consórcio de Caronas
 
-Servidor P2P em C para o consórcio de caronas compartilhadas (Problema 2, TEC502).
+Servidor P2P em C para um consórcio de caronas compartilhadas.
 Cada servidor representa uma empresa (uma região do mapa de Tamriel), guarda os próprios dados em disco e conversa
 somente com os vizinhos de fronteira por uma API REST. Não existe servidor central, coordenador fixo nem armazenamento compartilhado.
 
@@ -13,17 +13,22 @@ somente com os vizinhos de fronteira por uma API REST. Não existe servidor cent
 1. [Requisitos e compilação](#requisitos-e-compilação)
 2. [Como rodar](#como-rodar)
 3. [Estrutura do projeto](#estrutura-do-projeto)
-4. [Modelo de dados](#modelo-de-dados)
-5. [API do cliente](#api-do-cliente-passageiro-e-motorista)
-6. [API entre servidores (consórcio)](#api-entre-servidores-consórcio)
-7. [Diagramas de sequência](#diagramas-de-sequência)
-8. [Recuperação de falhas](#recuperação-de-falhas)
-9. [Persistência](#persistência)
-10. [Front web](#front-web)
-11. [Menu de testes e cliente de terminal](#menu-de-testes-e-cliente-de-terminal)
-12. [Exemplo completo com curl](#exemplo-completo-com-curl)
-13. [Testes](#testes)
-14. [Relatório técnico](#relatório-técnico)
+4. [Arquitetura](#arquitetura)
+5. [Modelo de dados](#modelo-de-dados)
+6. [API do cliente](#api-do-cliente-passageiro-e-motorista)
+7. [API entre servidores (consórcio)](#api-entre-servidores-consórcio)
+8. [Busca distribuída](#busca-distribuída)
+9. [Consistência: exclusão mútua, atomicidade, precedência e deadlock](#consistência-exclusão-mútua-atomicidade-precedência-e-deadlock)
+10. [Diagramas de sequência](#diagramas-de-sequência)
+11. [Tolerância a falhas](#tolerância-a-falhas)
+12. [Persistência e recuperação](#persistência-e-recuperação)
+13. [Front web](#front-web)
+14. [Menu de testes e cliente de terminal](#menu-de-testes-e-cliente-de-terminal)
+15. [Exemplo completo com curl](#exemplo-completo-com-curl)
+16. [Testes automatizados](#testes-automatizados)
+17. [Emulação com Docker em várias máquinas](#emulação-com-docker-em-várias-máquinas)
+18. [Decisões de projeto e limitações](#decisões-de-projeto-e-limitações)
+19. [Referências](#referências)
 
 ---
 
@@ -91,26 +96,7 @@ contêiner é recriado e o consórcio fica inconsistente.
 
 ### Cenário 3: várias máquinas (um contêiner por computador)
 
-Cada empresa roda no seu computador e precisa saber o IP dos vizinhos que estão em outras máquinas.
-
-```bash
-# 1. descubra o IP de cada máquina
-hostname -I                    # ex.: A = 192.168.0.10, B = 192.168.0.20, C = 192.168.0.30
-
-# 2. libere as portas (se houver firewall)
-sudo ufw allow 3001/tcp        # na máquina A (skyrim); 3002 na B; 3003 na C
-
-# 3. em cada máquina, suba só o seu serviço apontando para os vizinhos remotos
-HOST_MORROWIND=192.168.0.20 HOST_CYRODIIL=192.168.0.30 docker compose up --build -d skyrim   # máquina A
-HOST_SKYRIM=192.168.0.10 HOST_CYRODIIL=192.168.0.30 docker compose up --build -d morrowind   # máquina B
-HOST_SKYRIM=192.168.0.10 HOST_MORROWIND=192.168.0.20 docker compose up --build -d cyrodiil   # máquina C
-
-# 4. teste a comunicação
-curl -i 192.168.0.20:3002/api/consorcio/health
-```
-
-Sem Docker é igual, trocando o `docker compose up` por `./servidor <regiao>`. Se aparecer `FALHOU ... [TIMEOUT]`,
-confira o IP, o firewall e se o outro servidor está no ar.
+Veja [Emulação com Docker em várias máquinas](#emulação-com-docker-em-várias-máquinas).
 
 ### Cliente de terminal
 
@@ -150,10 +136,59 @@ util/
   util.c               buffer de texto, UUID, validação de ids, tempo
 testes/
   comum.py             utilitários compartilhados (HTTP, preparação, auditoria, relatório)
-  concorrencia.py      disputa simultânea por assentos (veja "Testes")
+  concorrencia.py      disputa simultânea por assentos
   carga.py             passageiros virtuais com carga alta e contínua
   falhas.py            a mesma carga com injeção de falhas nos servidores
 ```
+
+---
+
+## Arquitetura
+
+### Componentes e papéis
+
+| Componente | Papel |
+|---|---|
+| **Servidor de empresa** (`servidor`) | Uma instância por região. É dono exclusivo das caronas e dos usuários da sua empresa, expõe `/api/cliente` para os próprios usuários e `/api/consorcio` para os vizinhos. |
+| **Cliente motorista** | Cadastra-se e publica rotas **somente** no servidor da sua empresa; lista e exclui as próprias caronas. |
+| **Cliente passageiro** | Cadastra-se em **uma** empresa, busca itinerários e reserva por ela. Nunca fala com outras empresas: o servidor dele busca e reserva em nome dele. |
+| **Cliente de terminal / front web** | Interfaces do usuário final. Ambos usam só `/api/cliente`, por HTTP Basic. |
+| **Menu do servidor** | Console de operação e de testes de cada servidor (veja [Menu de testes](#menu-de-testes-e-cliente-de-terminal)). |
+
+Cada servidor tem as mesmas responsabilidades, em papéis que mudam por transação:
+
+- **Dono** de uma carona: único que conhece e decide os assentos dela.
+- **Coordenador** de uma reserva: o servidor do passageiro que fez o pedido; conduz o 2PC e grava a decisão.
+- **Participante**: qualquer servidor da cadeia que guarda assentos para aquela reserva.
+
+### Dados que cada servidor mantém
+
+| Dado | Onde fica | Observação |
+|---|---|---|
+| Usuários (com salt e hash da senha) | só na empresa do usuário | nenhuma outra empresa vê credenciais |
+| Caronas | só na empresa que a publicou | os assentos livres são calculados a partir das reservas |
+| Reservas | em **cada** servidor envolvido, apenas a parte dele | guarda estado, `anterior`, `proximo`, coordenador e os trechos locais; o itinerário completo só existe no coordenador |
+| Relógio de Lamport | memória, reconstruído do disco ao reiniciar | recomeça do maior valor visto nas reservas |
+
+Nenhum dado é replicado: cada fato (um assento, uma senha) tem um único dono.
+
+### Comparação com a arquitetura centralizada
+
+| Aspecto | Centralizada | Distribuída (este projeto) |
+|---|---|---|
+| Atomicidade de um itinerário | uma trava dentro do servidor central | 2PC entre servidores, com a decisão gravada em disco |
+| Dono dos dados | um servidor para todos | cada empresa é dona exclusiva das suas caronas e usuários |
+| Falha do servidor | o sistema inteiro para | só o que depende do servidor que caiu fica indisponível |
+| Ordem de eventos | relógio e fila de um só processo | relógio lógico de Lamport e desempate determinístico |
+| Latência de uma reserva | uma chamada local | cresce com o tamanho da cadeia (uma rodada de rede por empresa, duas vezes) |
+| Privacidade e independência | todas as empresas cedem os dados | nenhum dado sai do servidor da empresa dona |
+| Complexidade | baixa | alta: falhas parciais, recuperação e idempotência |
+
+**O que deixou de ser possível:** uma trava global que protege vários trechos de uma vez; um relógio único para ordenar pedidos; uma
+consulta SQL ou varredura que enxerga todas as caronas; e a ideia de que "se respondeu, está feito" (uma resposta pode se perder).
+
+**O que passou a ser necessário:** um protocolo de commit atômico (2PC); um relógio lógico e um critério de desempate; detecção de falhas por
+timeout; gravação durável de cada decisão; operações idempotentes; uma thread de recuperação; e busca em tempo real nos vizinhos.
 
 ---
 
@@ -295,11 +330,11 @@ Recusa (nada fica reservado em nenhum servidor):
 | 500 | falha ao gravar em disco |
 
 `propagacao_pendente: true` significa que a decisão foi **COMMIT** (já gravada em disco), mas alguma empresa estava fora do ar
-na hora de receber o aviso. Ela conclui sozinha ao voltar (veja [Recuperação de falhas](#recuperação-de-falhas)).
+na hora de receber o aviso. Ela conclui sozinha ao voltar (veja [Persistência e recuperação](#persistência-e-recuperação)).
 
 ### Listagem e cancelamento
 
-`GET /reservas` devolve `{"servidor", "reservas": [...], "total"}`, cada reserva no formato descrito em [Persistência](#persistência).
+`GET /reservas` devolve `{"servidor", "reservas": [...], "total"}`, cada reserva no formato descrito em [Persistência e recuperação](#persistência-e-recuperação).
 
 `DELETE /reservas/{id}` só funciona no servidor coordenador e para o dono da reserva:
 
@@ -399,6 +434,27 @@ da cadeia, menos quem enviou o aviso (`X-Server-Id`), então o aviso anda nos do
 200 `{"id_transacao", "status": "CANCELADA_MOTORISTA"}`, ou 200 "Nada a fazer aqui" se a reserva não existe ou já está `CANCELANDO`.
 **503** se algum vizinho não recebeu o aviso (o motorista repete a exclusão); 500 em falha de disco.
 
+### Requisição sem resposta e requisição repetida
+
+Em rede, "sem resposta" não diz se a operação aconteceu: ela pode ter sido executada e só a resposta se perdeu. Por isso:
+
+- **Quem chama nunca presume o resultado.** Sem resposta dentro do prazo, o chamador trata como falha, marca o vizinho como suspeito e
+  decide pelo protocolo: antes da decisão, **aborta**; depois da decisão, **repete até conseguir** (a thread de recuperação faz isso).
+- **Toda operação do consórcio é idempotente**, então repetir é sempre seguro:
+
+| Operação | O que acontece se for repetida |
+|---|---|
+| `prepare` | devolve READY sem ocupar outro assento |
+| `commit` | regrava `COMITADO` e repassa; sem efeito extra |
+| `DELETE` (rollback) | 200 mesmo se a reserva não existe; 409 se já confirmada, então um aborto atrasado nunca desfaz um commit |
+| `cancel` / `cancel-motorista` | 200 mesmo se já aplicado ou inexistente |
+| `status` | só leitura |
+
+- **Mensagens fora de ordem** são tratadas pelo estado gravado: um `commit` atrasado após cancelamento do motorista recebe 409 e não
+  ressuscita a reserva; um rollback atrasado após o commit recebe 409 e não a desfaz.
+- **Para o cliente final:** se a rede cair no meio de uma reserva ou cancelamento, o resultado é **desconhecido** e deve ser conferido em
+  `GET /reservas`; repetir `DELETE /reservas/{id}` é seguro.
+
 ### Tempos limite
 
 | Constante | Valor | Uso |
@@ -411,6 +467,100 @@ da cadeia, menos quem enviou o aviso (`X-Server-Id`), então o aviso anda nos do
 | `SUSPEITA_MS` | 5 s | quanto tempo um vizinho sem resposta fica "suspeito" |
 | `TIMEOUT_PREPARADO_S` | 5 s | idade mínima de uma reserva `PREPARADO` para a recuperação agir |
 | `INTERVALO_RECUPERACAO_S` | 2 s | intervalo entre ciclos da thread de recuperação |
+
+---
+
+## Busca distribuída
+
+**Estratégia: consulta em tempo real, sem catálogo replicado.** Cada empresa guarda só as próprias caronas; quando um passageiro busca,
+o servidor dele pergunta aos vizinhos na hora. Um catálogo replicado ficaria desatualizado a cada reserva e exigiria sincronização entre
+empresas, além de expor dados que hoje ficam só no dono.
+
+**Como funciona.** É uma busca em profundidade a partir da origem:
+
+1. O servidor que recebeu a busca lista as faixas das próprias caronas que partem da origem.
+2. Para cada cidade intermediária, oferece as faixas locais e envia `GET /trechos` aos vizinhos para o restante do caminho, passando a lista
+   de servidores já `visitados` (evita ciclos).
+3. Cada vizinho repete o processo com os seus vizinhos e devolve os itinerários que começam com uma carona dele.
+4. O servidor original junta, filtra os que têm assento livre em todas as faixas e devolve até 30 itinerários.
+
+Há limites de itinerários (30), consultas (40) e trechos (8) para a busca não explodir. A resposta é uma fotografia, sem reserva: a
+disponibilidade real só é decidida no `prepare`.
+
+**Quando uma empresa está fora do ar.** A busca é *best effort*: um vizinho que não responde vira "suspeito" por 5 s e é **pulado**
+(em dezenas de milissegundos, em vez de esperar o timeout a cada consulta). A busca devolve o que for possível com as demais empresas;
+só ficam de fora os itinerários que passariam pela empresa caída.
+
+---
+
+## Consistência: exclusão mútua, atomicidade, precedência e deadlock
+
+### Exclusão mútua do assento
+
+O assento só é decidido pelo servidor **dono** da carona, dentro de uma região crítica (`reservaPreparar` em `persistencia.c`) que
+verifica a disponibilidade, escolhe o assento e grava a reserva em disco, tudo sob uma trava única. Dois pedidos simultâneos, vindos de qualquer
+empresa, chegam ao mesmo dono e são serializados por essa trava, então nunca recebem o mesmo assento.
+
+**Por que assim:** o dono é o único que conhece o estado dos assentos, então é o único ponto onde a decisão pode ser linearizada. Uma
+exclusão mútua distribuída (token ou votação entre todas as empresas) custaria mensagens extras e dependeria de todos estarem no ar,
+sem ganho de segurança. Uma reserva só ocupa os trechos da sua faixa, e o número do assento é o mesmo ao longo dela.
+
+### Atomicidade: commit em duas fases em cadeia
+
+Os assentos de um itinerário estão em servidores diferentes, então nenhuma trava local os protege juntos. O protocolo é um 2PC em que os
+participantes formam uma **cadeia** (`coordenador → g1 → g2 → ...`), respeitando as fronteiras do mapa:
+
+1. **Fase 1 (prepare):** o coordenador grava `PREPARADO`, guarda os seus assentos e envia `POST /reservas/prepare` ao próximo servidor.
+   Cada participante guarda os próprios assentos, grava `PREPARADO` e repassa o restante da cadeia. O voto sobe de volta: **READY** só
+   se este servidor e todos adiante votaram sim; qualquer **NO**, erro ou timeout vira NO.
+2. **Decisão:** quem decide é **sempre o coordenador**. Com todos READY, ele grava `COMITADO` em disco: esse é o **ponto de não retorno**.
+   Com qualquer NO, decide abortar.
+3. **Fase 2 (commit):** `PUT /reservas/{id}/commit` percorre a cadeia, cada servidor grava `COMITADO` e repassa.
+
+**Quando um participante recusa:** o NO sobe pela cadeia; cada servidor que já tinha guardado assentos **apaga a própria reserva antes de
+responder NO**. Ao chegar ao coordenador, ele apaga a dele e responde `RECUSADO` ao passageiro. Resultado: nenhum assento fica preso em
+nenhuma empresa. Se um rollback não chegar a alguém, a recuperação o aplica (veja [Tolerância a falhas](#tolerância-a-falhas)).
+
+Cada servidor grava quem veio antes (`anterior`) e quem vem depois (`proximo`) na cadeia. Assim commit, rollback e cancelamento percorrem o
+mesmo caminho sem o coordenador falar com todo mundo, e cada participante sabe a quem perguntar se o aviso não chegar.
+
+**Por que 2PC.** Não há replicação de dados (cada assento tem um único dono), então consenso como Paxos ou Raft resolveria um problema que
+não existe aqui. O 2PC é o mínimo suficiente, e a cadeia respeita a restrição de que cada servidor só fala com vizinhos.
+
+### Precedência: quem fica com o último assento
+
+Relógios de parede não são confiáveis entre máquinas e as mensagens podem atrasar. Por isso cada transação recebe no coordenador um carimbo
+`(relógio de Lamport, id do coordenador, id da transação)`. É uma **ordem total** que respeita a causalidade e não depende de sincronização
+de relógios nem da ordem de chegada das mensagens: dois carimbos nunca empatam. O relógio é atualizado a cada mensagem com
+`max(local, recebido) + 1`.
+
+A regra tem dois níveis:
+
+1. **Há assento livre na faixa:** o primeiro pedido a chegar ao servidor dono é atendido. Chegar ao dono é o único ponto de linearização
+   possível, porque só ele conhece os assentos.
+2. **Não há assento livre, mas existem reservas `PREPARADO` na faixa** (ainda indecisas, podem liberar o assento): vale a regra *wait-die*.
+   Se a transação é **mais antiga** que todas as que seguram o assento, ela **espera** até `ESPERA_MAX_MS` pela decisão delas; se é
+   **mais nova** que alguma, **recusa na hora**.
+
+Um voto READY já dado nunca é retirado, porque retirá-lo quebraria o 2PC. Por isso, se a transação à frente confirmar, a mais antiga recebe NO.
+Em todos os casos o assento nunca é confirmado duas vezes.
+
+### Deadlock distribuído
+
+O caso crítico: duas reservas travam as mesmas duas caronas em **ordens opostas** (A pede X depois Y; B pede Y depois X). Sem cuidado, A
+espera B e B espera A para sempre.
+
+**Mecanismo: *wait-die* sobre a ordem total de Lamport (prevenção).** Só espera quem é **mais antigo** do que quem segura o recurso; o mais novo
+é recusado na hora ("morre") e o passageiro pode tentar de novo. Como toda espera aponta de um mais antigo para um mais novo, **nunca
+se forma um ciclo de espera**, então o deadlock é impossível. Mesmo que algo trave, a espera é limitada por `ESPERA_MAX_MS` (0,8 s).
+
+**Consequências para o desempenho:**
+
+- Não há detector de ciclos nem troca de mensagens extra para tratar deadlock.
+- Uma transação mais antiga pode esperar até 0,8 s por uma decisão alheia.
+- Uma transação mais nova que perde a disputa recebe recusa imediata, mesmo que o assento viesse a ser liberado depois (recusa conservadora):
+  sob alta contenção, algumas reservas são recusadas e precisam ser repetidas.
+- Sem disputa, o custo é zero: nenhuma espera ou recusa extra.
 
 ---
 
@@ -449,9 +599,6 @@ sequenceDiagram
         A-->>P: 409 RECUSADO (nada ficou reservado)
     end
 ```
-
-Cada servidor grava quem veio antes (`anterior`) e quem vem depois (`proximo`) na cadeia. Assim commit, rollback e cancelamento
-percorrem o mesmo caminho sem o coordenador falar com todo mundo, e cada participante sabe a quem perguntar se o aviso não chegar.
 
 ### Cancelamento de uma reserva confirmada
 
@@ -506,24 +653,29 @@ sequenceDiagram
 
 ---
 
-## Recuperação de falhas
+## Tolerância a falhas
 
-- **Detecção:** timeouts de conexão e de requisição. Um vizinho que falha fica "suspeito" por 5 s: a busca de itinerários o pula
-  (responde em dezenas de milissegundos em vez de esperar o timeout) e o 2PC continua tentando. As demais empresas seguem
-  operando normalmente para tudo que não depende dele.
-- **Gravação:** toda reserva é gravada (arquivo temporário + `fsync` + `rename`) **antes** de responder. Ao reiniciar, o servidor recarrega
-  tudo e o relógio de Lamport recomeça do maior valor visto nas reservas.
-- **Thread de recuperação** (a cada 2 s):
-  - reservas `PREPARADO` que ninguém está conduzindo e com mais de 5 s:
-    - *sou o coordenador:* não existe decisão COMMIT gravada, então **aborta** (*presumed abort*) e repassa o rollback;
-    - *sou participante:* pergunta o `status` a quem enviou o `prepare`. `COMITADO` → confirma aqui e repassa. `404` → aborta aqui e repassa.
-      Sem resposta ou ainda `PREPARADO` → tenta de novo.
-  - reservas `CANCELANDO` que este servidor coordena: repete o cancelamento pela cadeia até concluir.
-- **Requisições em andamento:** a reserva tem um indicador `ativo` enquanto uma requisição a conduz, para a recuperação não interferir.
+### Detecção
 
-Cenários cobertos: participante caído no meio da cadeia (recusa limpa, nada preso); participante travado com `SIGSTOP` (timeout, nada preso);
-coordenador morto **antes** da decisão (assentos presos só até ele voltar, depois liberados); coordenador morto **depois** da decisão
-(participantes convergem para `COMITADO`); empresa fora do ar durante um cancelamento (202, concluído quando ela voltar).
+Sem relógios sincronizados, a falha é detectada por **timeout** (conexão 1,5 s, requisição 3 s). Um vizinho que falha fica "suspeito" por 5 s:
+a busca o pula e o 2PC continua tentando. `GET /health` serve para checagem explícita. Um processo travado (`SIGSTOP`) e um caído
+(`SIGKILL`) são tratados do mesmo jeito: ambos estouram o timeout.
+
+### O que acontece quando uma empresa falha
+
+| Momento da falha | Quem falhou | Resultado |
+|---|---|---|
+| **Antes** de confirmar (durante o `prepare`) | participante | o `prepare` não completa (timeout ou 502); quem está antes na cadeia apaga a própria reserva e o coordenador responde `RECUSADO`. Nada fica preso. |
+| **Antes** da decisão, depois dos votos READY | coordenador | os participantes ficam `PREPARADO`. Ao voltar, o coordenador não encontra decisão gravada e **aborta** (*presumed abort*); os assentos são liberados. Até lá ficam presos só os assentos **dessa** transação. |
+| **Depois** da decisão, antes dos avisos | coordenador | a decisão `COMITADO` já está em disco. Os participantes perguntam `status` a quem enviou o `prepare` e convergem para `COMITADO`. |
+| **Durante** o commit (fase 2) | participante | a resposta traz `propagacao_pendente: true`; a decisão já vale e o participante conclui sozinho ao voltar, consultando o `status`. |
+| Durante um cancelamento | qualquer | resposta 202 `CANCELANDO`; a thread de recuperação repete até concluir. |
+
+**Reserva em andamento:** nunca é decidida por quem não tem autoridade. A decisão só existe no coordenador; participantes sem notícia
+perguntam a ele (via cadeia) e só agem com a resposta: `COMITADO` confirma, `404` aborta, sem resposta tenta de novo.
+
+**As demais empresas continuam operando.** Só o que depende do servidor caído falha: buscas o pulam, reservas que o incluem são recusadas
+com `502` e dizem qual empresa não respondeu, e todas as outras reservas, buscas, cadastros e caronas seguem normalmente.
 
 ### Injeção de falha (para testes)
 
@@ -539,7 +691,9 @@ Reinicie sem a variável e acompanhe o log (`[RECUPERACAO] ...`) para ver a conv
 
 ---
 
-## Persistência
+## Persistência e recuperação
+
+### O que é armazenado e quando
 
 Cada servidor tem três pastas, **um arquivo JSON por registro**, e nada é compartilhado entre empresas:
 
@@ -549,6 +703,20 @@ json/<servidor>/
   caronas/<id>.json              caronas publicadas aqui (dados fixos; assentos livres são calculados)
   reservas/<id_transacao>.json   participação deste servidor em cada transação
 ```
+
+| Momento | O que é gravado |
+|---|---|
+| Cadastro | `usuarios/<id>.json` |
+| Publicação de carona | `caronas/<id>.json` |
+| `prepare` (antes de votar READY) | reserva em `PREPARADO`, com assentos, `anterior`, `proximo` e coordenador |
+| Decisão de commit (coordenador) | reserva em `COMITADO`, **antes** de avisar qualquer participante |
+| Commit recebido (participante) | reserva em `COMITADO` |
+| Pedido de cancelamento | reserva em `CANCELANDO`, antes de propagar |
+| Exclusão de carona pelo motorista | reserva em `CANCELADA_MOTORISTA` |
+| Aborto ou cancelamento concluído | arquivo da reserva apagado |
+
+Toda gravação é atômica: arquivo temporário + `fsync` + `rename`, **antes** de qualquer resposta. Sobras `.tmp` são apagadas ao iniciar.
+Gravar a decisão antes de anunciá-la é o que torna o commit recuperável após uma queda.
 
 Exemplo de `reservas/<id>.json` em morrowind, no meio da cadeia skyrim → morrowind → cyrodiil:
 
@@ -561,10 +729,25 @@ Exemplo de `reservas/<id>.json` em morrowind, no meio da cadeia skyrim → morro
 ```
 
 `trechos` são as faixas que pertencem a **este servidor** (`de`/`ate` são os índices na rota da carona); `itinerario` só é
-preenchido no coordenador. As gravações são atômicas (temporário + `fsync` + `rename`) e sobras `.tmp` são apagadas ao iniciar.
-Em Docker, monte `json/` como volume (já feito no `docker-compose.yml`).
+preenchido no coordenador. Em Docker, monte `json/` como volume (já feito no `docker-compose.yml`).
 
 **Senhas:** PBKDF2-HMAC-SHA256 com 100 000 iterações e salt aleatório de 128 bits por usuário. A conferência usa comparação em tempo constante.
+
+### Como o servidor se recupera ao voltar
+
+1. **Recarrega** usuários, caronas e reservas do disco. Os assentos ocupados são recalculados a partir das reservas, e o relógio de Lamport
+   recomeça do maior valor visto nelas.
+2. **Thread de recuperação** (a cada 2 s):
+   - reservas `PREPARADO` que ninguém está conduzindo e com mais de 5 s:
+     - *sou o coordenador:* não existe decisão COMMIT gravada, então **aborta** (*presumed abort*) e repassa o rollback;
+     - *sou participante:* pergunta o `status` a quem enviou o `prepare`. `COMITADO` → confirma aqui e repassa. `404` → aborta aqui e repassa.
+       Sem resposta ou ainda `PREPARADO` → tenta de novo.
+   - reservas `CANCELANDO` que este servidor coordena: repete o cancelamento pela cadeia até concluir.
+3. **Requisições em andamento:** a reserva tem um indicador `ativo` enquanto uma requisição a conduz, para a recuperação não interferir.
+
+**Por que o consórcio fica consistente:** a única decisão que importa (commit ou abort) tem um único dono, o coordenador, e é gravada em disco antes de ser
+anunciada. Todos os demais estados são derivados dela, e todas as operações são idempotentes, então repetir até convergir é sempre seguro.
+Na dúvida, aborta-se (*presumed abort*); depois do commit gravado, nunca se desfaz.
 
 ---
 
@@ -654,32 +837,34 @@ dos outros servidores voltam a ficar livres. Para simular um servidor travado:
 
 ---
 
-## Testes
+## Testes automatizados
 
 Os scripts ficam em `testes/`, usam só a biblioteca padrão do Python 3.8+ e compartilham o `comum.py` (requisições HTTP, preparação de caronas
 e passageiros, auditoria das invariantes e relatório). Compile antes com `make`.
 
-| Script | Servidores | O que faz |
-|---|---|---|
-| `concorrencia.py` | já rodando (`skyrim`, `morrowind`, `cyrodiil` em localhost) | disputas simultâneas por assentos |
-| `carga.py` | já rodando | passageiros virtuais que buscam, reservam e cancelam sem parar |
-| `falhas.py` | **sobe os próprios** (o executável `./servidor`) | a mesma carga com queda e trava de servidores |
+| Script | Foco | Servidores | O que faz |
+|---|---|---|---|
+| `concorrencia.py` | exclusão mútua e deadlock | já rodando (`skyrim`, `morrowind`, `cyrodiil` em localhost) | disputas simultâneas por assentos entre coordenadores diferentes |
+| `carga.py` | desempenho e contenção | já rodando | passageiros virtuais que buscam, reservam e cancelam sem parar |
+| `falhas.py` | tolerância a falhas e recuperação | **sobe os próprios** (o executável `./servidor`) | a mesma carga com queda e trava de servidores |
 
 Os três terminam com código 0 se todas as invariantes se mantiveram e 1 caso contrário.
 
 ### Concorrência
 
-`testes/concorrencia.py` precisa de `skyrim`, `morrowind` e `cyrodiil` rodando em localhost. A cada rodada cria caronas novas com
-**um único assento** e dispara reservas simultâneas por coordenadores diferentes:
+A cada rodada cria caronas novas com **um único assento** e dispara reservas simultâneas por coordenadores diferentes:
 
 ```bash
 python3 testes/concorrencia.py 20      # 20 rodadas de cada cenário
 ```
 
-Cenários: (`unico`) três coordenadores disputam o último assento da mesma carona; (`cruzado`) duas reservas travam as mesmas duas
-caronas em ordem oposta; (`sobreposto`) quatro reservas com cadeias que se sobrepõem. Ao fim de cada rodada audita: nenhum assento
-duplicado, nenhum overbooking, nenhuma reserva `PREPARADO` sobrando e nenhuma reserva confirmada pela metade.
-Resultado esperado: `confirmadas_por_rodada={1: N}` e `violacoes=0`.
+| Cenário | O que testa |
+|---|---|
+| `unico` | três coordenadores disputam o último assento da mesma carona (exclusão mútua e precedência) |
+| `cruzado` | duas reservas travam as mesmas duas caronas em ordem oposta (ausência de deadlock) |
+| `sobreposto` | quatro reservas com cadeias que se sobrepõem (atomicidade sob contenção) |
+
+Resultado esperado: `confirmadas_por_rodada={1: N}` (exatamente uma confirmada por rodada) e `violacoes=0`.
 
 ### Carga contínua
 
@@ -720,94 +905,92 @@ toda reserva cancelada sumiu de todas as empresas; e nenhuma confirmação que o
 
 ---
 
-## Relatório técnico
+## Emulação com Docker em várias máquinas
 
-Resumo das decisões de projeto, base para o relatório no formato SBC.
+Cada empresa roda em um contêiner no seu próprio computador. O `docker-compose.yml` define um serviço por região, e as variáveis `HOST_<REGIAO>`
+dizem onde está cada vizinho que não roda na mesma máquina.
 
-### Requisitos do enunciado e onde são atendidos
+**Comunicação entre as máquinas.** Cada contêiner publica a porta da sua região (3001 a 3009) no host. Os vizinhos remotos são alcançados
+por `IP-da-máquina:porta`, com o IP informado em `HOST_<REGIAO>`; a porta de cada vizinho é sempre a padrão da tabela de regiões. As máquinas precisam
+estar na mesma rede e com as portas liberadas no firewall.
+
+```bash
+# 1. descubra o IP de cada máquina
+hostname -I                    # ex.: A = 192.168.0.10, B = 192.168.0.20, C = 192.168.0.30
+
+# 2. libere as portas (se houver firewall)
+sudo ufw allow 3001/tcp        # na máquina A (skyrim); 3002 na B; 3003 na C
+
+# 3. em cada máquina, suba só o seu serviço apontando para os vizinhos remotos
+HOST_MORROWIND=192.168.0.20 HOST_CYRODIIL=192.168.0.30 docker compose up --build -d skyrim   # máquina A
+HOST_SKYRIM=192.168.0.10 HOST_CYRODIIL=192.168.0.30 docker compose up --build -d morrowind   # máquina B
+HOST_SKYRIM=192.168.0.10 HOST_MORROWIND=192.168.0.20 docker compose up --build -d cyrodiil   # máquina C
+
+# 4. teste a comunicação
+curl -i 192.168.0.20:3002/api/consorcio/health
+```
+
+Sem Docker é igual, trocando o `docker compose up` por `./servidor <regiao>`. Se aparecer `FALHOU ... [TIMEOUT]`,
+confira o IP, o firewall e se o outro servidor está no ar.
+
+**Provocar e observar uma falha:**
+
+| Ação (na máquina da empresa) | Efeito |
+|---|---|
+| `docker compose stop morrowind` | queda da empresa (processo encerrado) |
+| `docker compose start morrowind` | a empresa volta e se recupera, mantendo os dados do volume |
+| `docker kill -s STOP morrowind` / `docker kill -s CONT morrowind` | trava e retoma o processo (sem resposta, não caído) |
+| `INJETAR_FALHA=antes_decisao docker compose up -d skyrim` | queda abrupta em um ponto exato do protocolo |
+
+**Como observar:**
+
+- `docker compose logs -f <servico>`: mostra `FALHOU ... [TIMEOUT]` nos vizinhos e as linhas `[RECUPERACAO]` da convergência.
+- Menu do servidor (`docker attach <servico>`), opção 2: `GET /health` de todos os vizinhos.
+- `curl <ip>:<porta>/api/consorcio/reservas` em cada máquina: mostra o estado de cada reserva (`PREPARADO`, `COMITADO`...) antes, durante e depois da falha.
+- Tentar uma reserva que passe pela empresa caída: responde `RECUSADO` (502) citando qual empresa não respondeu, e reservas que não a usam continuam funcionando.
+
+---
+
+## Decisões de projeto e limitações
+
+### Requisitos de projeto e onde são atendidos
 
 | Requisito | Solução | Código |
 |---|---|---|
-| 1. Atomicidade do itinerário | commit em duas fases em cadeia; ponto de não retorno = gravar a decisão em disco no coordenador | `transacao.c` |
-| 2. Um assento, um passageiro | escolha e gravação do assento sob uma trava única no servidor dono da carona | `persistencia.c` (`reservaPreparar`) |
-| 3. Precedência em disputas | ordem total `(relógio de Lamport, coordenador, id)` + regra *wait-die* | `persistencia.c`, `lamport.c` |
-| 4. Falhas | gravação durável, timeouts, detector de suspeitos e thread de recuperação (*presumed abort*) | `persistencia.c`, `httpCliente.c`, `transacao.c` |
+| Atomicidade do itinerário | commit em duas fases em cadeia; ponto de não retorno = gravar a decisão em disco no coordenador | `transacao.c` |
+| Um assento, um passageiro | escolha e gravação do assento sob uma trava única no servidor dono da carona | `persistencia.c` (`reservaPreparar`) |
+| Precedência em disputas | ordem total `(relógio de Lamport, coordenador, id)` + regra *wait-die* | `persistencia.c`, `lamport.c` |
+| Falhas | gravação durável, timeouts, detector de suspeitos e thread de recuperação (*presumed abort*) | `persistencia.c`, `httpCliente.c`, `transacao.c` |
 | Sem componente central | cada transação tem o próprio coordenador (o servidor que recebeu o pedido); dados só na empresa dona | todo o projeto |
 | API REST entre servidores | HTTP + JSON entre vizinhos de fronteira, com cabeçalhos de relógio lógico | `httpServidor.c`, `httpCliente.c` |
 | Coordenação própria | 2PC, exclusão mútua e recuperação implementados aqui, sem bancos nem serviços de coordenação | `transacao.c`, `persistencia.c` |
 | Contêiner por empresa | `Dockerfile` e `docker-compose.yml` com volume de dados por servidor | raiz do projeto |
 
-### Arquitetura centralizada (Problema 1) × distribuída (Problema 2)
+### Decisões
 
-| Aspecto | Centralizada | Distribuída (este projeto) |
-|---|---|---|
-| Atomicidade de um itinerário | uma trava dentro do servidor central | 2PC entre servidores, com a decisão gravada em disco |
-| Dono dos dados | um servidor para todos | cada empresa é dona exclusiva das suas caronas e usuários |
-| Falha do servidor | o sistema inteiro para | só as caronas que dependem do servidor que caiu ficam indisponíveis |
-| Ordem de eventos | relógio e fila de um só processo | relógio lógico de Lamport e desempate determinístico |
-| Latência de uma reserva | uma chamada local | cresce com o tamanho da cadeia (uma rodada de rede por empresa, duas vezes) |
-| Privacidade e independência | todas as empresas cedem os dados | nenhum dado sai do servidor da empresa dona |
-| Complexidade | baixa | alta: parcialidade de falhas, recuperação e idempotência |
-
-A comparação quantitativa (latência e vazão sob carga) deve usar as medições do `carga.py` (veja [Testes](#testes)).
-
-### Decisões de projeto
-
-**Commit em duas fases em cadeia.** Os assentos de um itinerário estão em servidores diferentes, então nenhuma trava local os protege juntos, e é
-preciso um protocolo de commit atômico. O 2PC é o mínimo suficiente: não há replicação de dados (cada assento tem um único dono), então
-protocolos de consenso como Paxos ou Raft resolveriam um problema que não temos. A topologia em cadeia respeita a restrição de que
-cada servidor só fala com vizinhos de fronteira (firewalls das empresas) e dispensa o coordenador de conhecer todos os participantes.
-O custo é que a latência cresce com o comprimento da cadeia e os prazos precisam ser escalonados.
-
-**Quem coordena.** Não há coordenador fixo: o servidor que recebe o pedido do passageiro coordena aquela transação e grava a decisão. Dois pedidos
-em servidores diferentes têm coordenadores diferentes e nunca dependem de um ponto único.
-
-**Exclusão mútua do assento.** O assento só é decidido pelo servidor dono da carona, dentro de uma região crítica que verifica, escolhe
-e grava a reserva em disco. Isso garante que dois pedidos simultâneos, vindos de onde vierem, nunca recebam o mesmo assento.
-Uma reserva só ocupa os trechos da sua faixa, e o número do assento é o mesmo ao longo dela.
-
-**Precedência (requisito 3) e relógio de Lamport.** Relógios de parede não são confiáveis entre máquinas, então cada transação recebe no
-coordenador o carimbo `(relógio de Lamport, id do coordenador, id da transação)`, uma **ordem total** que respeita a causalidade e não
-depende de sincronização nem da ordem de chegada das mensagens. A regra tem dois níveis:
-
-1. Enquanto houver assento livre na faixa, o primeiro pedido a chegar ao servidor dono é atendido. Chegar ao dono é o único ponto
-   de linearização possível, porque só ele conhece os assentos.
-2. Quando **não** há assento livre mas existem reservas `PREPARADO` na faixa (ainda indecisas), vale o *wait-die*: se a transação é
-   **mais antiga** que todas as que seguram o assento, ela **espera** até `ESPERA_MAX_MS` pela decisão delas (que pode liberar o assento);
-   se é **mais nova** que alguma, **recusa na hora**.
-
-Quem espera é sempre mais antigo que quem é esperado, então **não há ciclo de espera nem deadlock**, mesmo quando duas reservas
-travam as mesmas caronas em ordem oposta. Um voto READY já dado nunca é retirado, porque retirá-lo quebraria o 2PC; por isso, se a
-transação à frente confirmar, a mais antiga recebe NO. Em todos os casos o assento nunca é confirmado duas vezes.
-
-**Persistência durável.** Toda mudança de estado é gravada com arquivo temporário, `fsync` e `rename` antes de qualquer resposta. A decisão do
-coordenador também é gravada antes de ser anunciada: é o que torna o commit recuperável após uma queda.
-
-**Detecção e recuperação.** A queda é detectada por timeout (sem relógio sincronizado), e um vizinho sem resposta vira "suspeito" por 5 s, o que
-evita esperar o timeout a cada busca. Para transações sem decisão vale o *presumed abort* (Mohan et al., 1986): na dúvida, o coordenador
-aborta, e o participante pergunta o estado a quem lhe enviou o `prepare`. O cancelamento segue a mesma ideia: a decisão `CANCELANDO` é gravada
-primeiro e a thread de recuperação a conclui, mesmo com empresas fora do ar.
-
-**Idempotência.** `prepare`, `commit`, `rollback` e `cancel` podem ser repetidos sem efeito colateral, pois a rede pode entregar uma mensagem duas vezes
-ou o chamador pode não ter visto a resposta. É isso que permite a recuperação simplesmente tentar de novo.
-
-**Busca de itinerários.** Busca em profundidade a partir da origem: em cada cidade, oferece todas as faixas das caronas locais e pergunta aos vizinhos
-o restante do caminho. A lista de servidores visitados evita ciclos, e há limites de itinerários (30), consultas (40) e trechos (8) para a busca
-não explodir. É uma fotografia sem reserva; a disponibilidade real só é decidida no `prepare`.
-
-**Autenticação.** Senhas guardadas só como hash com salt (PBKDF2). O servidor da empresa é o único que conhece as credenciais dos seus usuários.
+- **Quem coordena.** Não há coordenador fixo: o servidor que recebe o pedido do passageiro coordena aquela transação e grava a decisão. Dois pedidos
+  em servidores diferentes têm coordenadores diferentes e nunca dependem de um ponto único.
+- **Topologia em cadeia.** Respeita a restrição de que cada servidor só fala com vizinhos de fronteira (firewalls das empresas) e dispensa o
+  coordenador de conhecer todos os participantes. O custo é que a latência cresce com o comprimento da cadeia e os prazos precisam ser escalonados.
+- **Persistência durável.** Toda mudança de estado é gravada com arquivo temporário, `fsync` e `rename` antes de qualquer resposta.
+- **Detecção e recuperação.** Timeout, sem relógio sincronizado; *presumed abort* (Mohan et al., 1986) para transações sem decisão.
+- **Idempotência.** `prepare`, `commit`, `rollback` e `cancel` podem ser repetidos sem efeito colateral, o que permite à recuperação simplesmente tentar de novo.
+- **Autenticação.** Senhas guardadas só como hash com salt (PBKDF2). O servidor da empresa é o único que conhece as credenciais dos seus usuários.
 
 ### Limitações conhecidas
 
 - **Bloqueio do 2PC:** se o coordenador cair depois de os participantes votarem READY e antes de decidir, os assentos **daquela** transação
   ficam presos até ele voltar (a decisão só existe nele). Os demais assentos e as demais empresas não são afetados.
-- **Cadeia por fronteiras:** os servidores de um itinerário precisam formar um caminho de vizinhos no mapa. É uma decisão de projeto, não do enunciado.
+- **Cadeia por fronteiras:** os servidores de um itinerário precisam formar um caminho de vizinhos no mapa. É uma decisão de projeto.
 - **Segurança:** o HTTP Basic trafega sem TLS e as rotas `/api/consorcio` não são autenticadas; o projeto assume uma rede entre
   empresas protegida por firewall. Em produção seria preciso TLS (mTLS entre servidores).
 - **Disponibilidade da busca:** a busca é *best effort*; empresas suspeitas são puladas e podem faltar opções nos resultados.
 - **Prazos fixos:** os timeouts são constantes de compilação, não adaptativos.
+- **Recusa conservadora sob contenção:** o *wait-die* pode recusar uma reserva mais nova que teria assento depois; o passageiro precisa repetir.
 
-### Referências
+---
+
+## Referências
 
 - Lamport, L. *Time, Clocks, and the Ordering of Events in a Distributed System.* Communications of the ACM, 21(7), 1978.
 - Gray, J. *Notes on Data Base Operating Systems.* In: Operating Systems: An Advanced Course, LNCS 60, Springer, 1978.
